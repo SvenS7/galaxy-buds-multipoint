@@ -1,76 +1,88 @@
 # galaxy-buds-multipoint
 
-Enable Galaxy Buds multipoint on a computer, with no Samsung account.
+Galaxy Buds multipoint on your computer — no Samsung account needed.
 
 *[한국어](README.ko.md)*
 
-Galaxy Buds2 Pro support multipoint, but they hang up on your phone the moment a
-non-Galaxy device starts playing audio. The usual explanation is that Samsung
-gates multipoint behind "both devices on the same Samsung account", and that a
-computer cannot satisfy it.
+You probably know the moment. Your Galaxy Buds2 Pro are connected to your phone
+and your laptop at the same time, which is the entire point of multipoint, and
+then you press play on the laptop and the buds quietly hang up on your phone.
 
-That turns out to be the wrong diagnosis. The firmware checks a version byte
-first, and a computer fails on *that*, never reaching the account check at all.
-The byte is set by a single protocol frame that a Galaxy phone sends at pairing
-and that no third-party client sends. Send it once and multipoint works — phone
-and computer connected at the same time, no account involved.
+Ask around and you'll get the same answer everywhere: Samsung gates multipoint
+behind "both devices signed in to the same Samsung account", and a computer
+simply cannot satisfy that. It sounds convincing. It's also the wrong diagnosis.
+
+The firmware does look at your account — but only after it checks something else
+first, and a computer trips on *that* one, well before the account ever comes up.
+What it checks is a single version byte, set by one protocol frame that a Galaxy
+phone sends while pairing and that no third-party client sends. Send it once and
+multipoint behaves: phone and computer connected together, account never
+consulted.
 
 ```bash
 cd macos && ./budsmp apply
 ```
 
-One frame, `fc0b00014304030400000b021eafcc`, written once. It persists in the
-buds' own storage, so reconnects and reboots keep working, and `./budsmp revert`
-puts it back exactly as it was.
+That's the whole thing. One frame, `fc0b00014304030400000b021eafcc`, written a
+single time. It lives in the buds' own storage, so reconnects and reboots keep
+working, and if you'd rather undo it, `./budsmp revert` puts everything back
+exactly as it was.
 
-## Status
+## Where things stand
 
 | platform | state | how |
 |---|---|---|
 | macOS 11+ | working, verified on hardware | Swift + IOBluetooth, in [macos/](macos/) |
-| Linux | implemented, not yet run against buds | Python + `AF_BLUETOOTH`, in [linux/](linux/) |
-| Windows 10+ | implemented, not yet run against buds | Python + `AF_BTH`, in [windows/](windows/) |
+| Linux | written, not yet run against buds | Python + `AF_BLUETOOTH`, in [linux/](linux/) |
+| Windows 10+ | written, not yet run against buds | Python + `AF_BTH`, in [windows/](windows/) |
 
-"Not yet run against buds" is meant literally. The Linux and Windows tools build
+That middle column means exactly what it says. The Linux and Windows tools build
 byte-for-byte the same frames as the macOS one, checked against frames captured
-from real hardware, and their socket, discovery and reporting paths have their own
-tests — but nobody has yet pointed them at actual buds. If you try it, please say
-whether it worked.
+from real hardware, and their socket, discovery and reporting paths have tests of
+their own — but nobody has actually pointed them at a pair of buds yet. If you
+get there first, it would be great to hear how it went.
 
-Developed and confirmed on Galaxy Buds2 Pro. The mechanism is not model-specific
-and should apply to other Galaxy Buds that advertise `SPPSERVICE4`, but that is
-untested — reports welcome.
+All of this was developed and confirmed on Galaxy Buds2 Pro. The mechanism isn't
+model-specific, so other Galaxy Buds that advertise `SPPSERVICE4` should work the
+same way, though that's untested — reports very welcome.
 
-## How it works
+## What's actually going on
 
-When audio comes up on a second device, the buds run a two-stage check:
+When audio comes up on a second device, the buds run a two-stage check.
 
-1. **`asVer` gate.** Every paired peer has an `asVer` byte in the buds' storage.
-   If either peer's value is outside `{2, 3}`, the buds disconnect one of them
-   (reason `0xa9`).
-2. **Account gate.** Only reached if stage 1 passed. Compares the two peers'
-   Samsung account hashes — and skips the comparison entirely when one peer is
-   classified "special", which a computer is.
+**Stage one — the `asVer` gate.** The buds keep a small record for every peer
+they're paired with, and one byte of it is `asVer`. If either peer's value lands
+outside `{2, 3}`, the buds disconnect one of them with reason `0xa9`. This is the
+stage a computer never gets past.
 
-`asVer` is written by exactly one message, `MDE_VERSION`, on the `SPPSERVICE4`
-RFCOMM channel. A Galaxy phone sends it while pairing. Third-party clients such as
-[GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient) connect to a
-*different* channel (`GEARMANAGER`) and never send it, so their `asVer` stays `0`
-and they trip stage 1 forever.
+**Stage two — the account gate.** Only reached once stage one passes. It compares
+the two peers' Samsung account hashes, and skips the comparison altogether when
+one peer is classified "special" — which a computer is.
 
-So the fix is to send that one message. The handler validates nothing beyond
-`version <= 3` — no signature, no nonce, no account material.
+So the account check everyone blames was never really the obstacle. Your computer
+wasn't failing it; it was never reaching it.
 
-The account hash genuinely is not needed, and that is not an assumption. It was
-tested on hardware, including a positive control to prove the gate was live: a
-deliberately wrong account left the phone connected, a zeroed account left the
-phone connected, and `asVer = 0` with the *correct* account dropped it. Method and
-results in [docs/experiments.md](docs/experiments.md).
+Exactly one message writes `asVer`: `MDE_VERSION`, on the `SPPSERVICE4` RFCOMM
+channel. A Galaxy phone sends it during pairing. Third-party clients such as
+[GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient) talk to a
+*different* channel (`GEARMANAGER`) and never send it, so their `asVer` stays at
+`0` and stage one keeps catching them.
 
-Full detail: [docs/protocol.md](docs/protocol.md) for the wire format,
-[docs/firmware-gate.md](docs/firmware-gate.md) for the firmware side.
+Which makes the fix pleasantly boring: send that one message. Its handler
+validates nothing beyond `version <= 3` — no signature, no nonce, nothing
+account-shaped.
 
-## Install and use
+And that the account hash genuinely doesn't matter isn't an assumption. It was
+tested on hardware, with a positive control to show the gate was live: a
+deliberately wrong account left the phone connected, a zeroed account left it
+connected, and `asVer = 0` with the *correct* account dropped it. Method and
+results are in [docs/experiments.md](docs/experiments.md).
+
+If you want the full picture, [docs/protocol.md](docs/protocol.md) covers the
+wire format and [docs/firmware-gate.md](docs/firmware-gate.md) covers the
+firmware side.
+
+## Getting it running
 
 ### macOS
 
@@ -81,9 +93,10 @@ cd galaxy-buds-multipoint/macos
 ./budsmp apply
 ```
 
-Requires the Xcode command line tools (`xcode-select --install`) and nothing else.
-Connect the buds first, and **click Allow** when macOS asks for Bluetooth access —
-the tool waits for that answer, and the dialog likes to hide behind other windows.
+You'll need the Xcode command line tools (`xcode-select --install`), and nothing
+else. Connect the buds first, and when macOS asks for Bluetooth access, **click
+Allow** — the tool sits and waits for that answer, and the dialog has a habit of
+hiding behind other windows.
 
 ```bash
 ./budsmp read      # what the buds have stored for this host
@@ -91,9 +104,9 @@ the tool waits for that answer, and the dialog likes to hide behind other window
 ./budsmp --help    # every command and option
 ```
 
-If `apply` cannot open the channel, the buds are asleep: take them out of the
-case, select them as the audio output device, start playing something, and retry.
-See [macos/README.md](macos/README.md) for the rest of the failure modes.
+If `apply` can't open the channel, the buds are asleep. Take them out of the
+case, make them your audio output, play something, and try again.
+[macos/README.md](macos/README.md) walks through the other failure modes.
 
 ### Linux
 
@@ -103,9 +116,10 @@ cd galaxy-buds-multipoint/linux
 ./budsmp apply
 ```
 
-Needs Python 3.9+ and BlueZ, both of which a desktop Linux already has. Nothing
-to build — RFCOMM comes from the standard library. Pair the buds first
-(`bluetoothctl`), then see [linux/README.md](linux/README.md).
+Needs Python 3.9+ and BlueZ, which a desktop Linux almost certainly already has.
+There's nothing to build — RFCOMM comes straight from the standard library. Pair
+the buds first with `bluetoothctl`, then have a look at
+[linux/README.md](linux/README.md).
 
 ### Windows
 
@@ -118,9 +132,9 @@ budsmp apply
 Needs Python 3.9+ and nothing else — no administrator rights, no build step. Pair
 the buds in Settings first, then see [windows/README.md](windows/README.md).
 
-### Protocol tools
+### Just the protocol tools
 
-The frame builder and decoder work anywhere Python 3 runs, with no dependencies:
+The frame builder and decoder run anywhere Python 3 does, with no dependencies:
 
 ```bash
 cd python
@@ -129,57 +143,62 @@ python3 -m budsmp.frame decode fc0b00014304030400000b021eafcc   # take it apart
 python3 -m budsmp.frame selftest                               # check against captured bytes
 ```
 
-## Is this safe?
+## Is this safe to run?
 
-It writes one byte-sized field in a per-device record the buds already keep for
-your computer. Specifically:
+A fair thing to ask before letting a stranger's code near your headphones. What
+it does is write one byte-sized field in a per-device record the buds already
+keep for your computer. Which means:
 
-- **Reversible.** `./budsmp revert` restores the original value. No re-pairing.
-- **No firmware modification.** Nothing is flashed. This is a normal protocol
-  message that the buds accept over a channel they advertise.
-- **Nothing sent anywhere.** No network, no account, no telemetry. The only thing
-  that talks to the buds is your own machine, over Bluetooth.
-- **Scoped to your host.** Only the record for the computer you run it on is
-  touched. Your phone's record is not modified.
-- **Does not survive a factory reset** of the buds. If you reset them, run it
-  again.
+- **It's reversible.** `./budsmp revert` restores the original value, and you
+  won't have to re-pair anything.
+- **No firmware modification.** Nothing is flashed. This is an ordinary protocol
+  message, sent over a channel the buds themselves advertise, and they accept it
+  the same way they'd accept it from a phone.
+- **Nothing leaves your machine.** No network, no account, no telemetry. The only
+  thing talking to your buds is your own computer, over Bluetooth.
+- **Only your host is touched.** The record for the computer you run it on, and
+  nothing else — your phone's record is left alone.
+- **A factory reset clears it.** If you ever reset the buds, just run it again.
 
-What it does not do: it does not unlock features your buds do not have, does not
-alter audio processing, and does not change anything on your phone.
+What it doesn't do is equally clear: it won't unlock features your buds don't
+have, it doesn't touch audio processing, and it changes nothing on your phone.
 
-The worst realistic failure is that the buds temporarily drop one device, which is
-the same thing they were doing before the fix, and which the next write undoes.
+Realistically the worst that happens is the buds briefly drop one device — which
+is the thing they were already doing before the fix, and which the next write
+undoes.
 
 ## Limitations
 
-- Only the host you run it on gets fixed. A second computer needs its own run.
-- The buds hold two active links; this does not raise that limit.
-- Audio follows the actively playing device. Starting playback on the idle device
-  does not steal the stream until the other one stops. Normal multipoint
-  arbitration, not a defect.
+- Only the host you run it on gets fixed, so a second computer needs its own run.
+- The buds hold two active links, and this doesn't raise that ceiling.
+- Audio follows whichever device is actively playing. Starting playback on the
+  idle one won't steal the stream until the other stops. That's ordinary
+  multipoint arbitration rather than a defect.
 - A buds factory reset clears it.
 
 ## Disclaimer
 
-This is the result of reverse engineering hardware the author owns, for
-interoperability with it — documenting a protocol detail so that devices already
-in someone's possession work together. It ships no Samsung code.
+This is reverse engineering of hardware the author owns, done for
+interoperability with it — documenting one protocol detail so that devices
+already sitting in someone's pocket work together properly. It ships no Samsung
+code.
 
-Use it on your own devices. It is not affiliated with, endorsed by, or supported
-by Samsung, and it may well void your warranty or stop working after a firmware
-update. Provided as is, with no warranty — see [LICENSE](LICENSE).
+Please use it on your own devices. It isn't affiliated with, endorsed by, or
+supported by Samsung, it may well void your warranty, and a firmware update could
+stop it working at any time. It comes as is, with no warranty of any kind — see
+[LICENSE](LICENSE).
 
 "Galaxy Buds" and "Samsung" are trademarks of Samsung Electronics.
 
 ## Contributing
 
-Useful things to report:
+Things that would genuinely help:
 
-- **Did the Linux or Windows tool work?** Both are written but unproven against
-  real buds; a "worked" or "failed with this log" is the most useful thing anyone
-  can send right now.
-- Other Galaxy Buds models: does `budsmp scan` show `SPPSERVICE4`, and does
-  `apply` work? Include the model and firmware version.
+- **Did the Linux or Windows tool work for you?** Both are written but unproven
+  against real buds, so a simple "worked" or "failed, here's the log" is the most
+  valuable thing anyone can send right now.
+- **Other Galaxy Buds models.** Does `budsmp scan` show `SPPSERVICE4`, and does
+  `apply` do the trick? Please include the model and firmware version.
 
-When posting logs, scrub them first. `budsmp` output contains your Bluetooth
-addresses, and `read` prints your Samsung account hash.
+One request: scrub your logs before posting them. `budsmp` output contains your
+Bluetooth addresses, and `read` prints your Samsung account hash.
