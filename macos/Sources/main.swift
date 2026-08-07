@@ -483,6 +483,7 @@ COMMANDS
                    This is the fix. It persists in the buds' NVRAM.
   revert           Write asVer=0, restoring the stock account-gated behaviour.
   read             Read back the stored device state (asVer, account hashes).
+                   Writes --asver first (default 2) to make the buds report.
   send <hex>...    Send raw SMEP frames, then listen.
   scan             List paired Bluetooth devices and their RFCOMM services.
   sdp              Run a fresh SDP query on the target and dump the channel map.

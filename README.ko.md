@@ -25,11 +25,16 @@ cd macos && ./budsmp apply
 
 ## 지원 현황
 
-| 플랫폼 | 상태 |
-|---|---|
-| macOS | 동작 확인, 실제 기기에서 검증 |
-| Linux | 예정 — `AF_BLUETOOTH` / `BTPROTO_RFCOMM` |
-| Windows | 예정 — `AF_BTH` / `BTHPROTO_RFCOMM` |
+| 플랫폼 | 상태 | 구현 |
+|---|---|---|
+| macOS 11+ | 동작 확인, 실제 기기에서 검증 | Swift + IOBluetooth, [macos/](macos/) |
+| Linux | 구현 완료, 실제 기기 검증 전 | Python + `AF_BLUETOOTH`, [linux/](linux/) |
+| Windows 10+ | 구현 완료, 실제 기기 검증 전 | Python + `AF_BTH`, [windows/](windows/) |
+
+"실제 기기 검증 전"은 말 그대로다. Linux와 Windows 도구는 macOS 쪽과 바이트 단위로
+동일한 프레임을 만들고 실제 하드웨어에서 캡처한 프레임과 대조해 확인했으며, 소켓·기기
+탐색·리포트 경로도 각각 테스트가 있다. 다만 아직 아무도 실제 버즈에 대고 돌려보지
+않았다. 시도했다면 결과를 알려주면 좋겠다.
 
 Galaxy Buds2 Pro에서 개발하고 확인했다. 동작 원리는 특정 모델에 종속되지 않으므로
 `SPPSERVICE4`를 광고하는 다른 Galaxy Buds에서도 통할 것으로 보이지만, 검증되지
@@ -88,6 +93,29 @@ Xcode 커맨드 라인 도구(`xcode-select --install`) 외에는 아무것도 �
 장치로 선택한 뒤 아무거나 재생하고 다시 시도한다. 나머지 실패 상황은
 [macos/README.md](macos/README.md)에 정리해 두었다.
 
+### Linux
+
+```bash
+git clone https://github.com/id6917824/galaxy-buds-multipoint
+cd galaxy-buds-multipoint/linux
+./budsmp apply
+```
+
+Python 3.9 이상과 BlueZ가 필요한데, 데스크톱 Linux라면 둘 다 이미 있다. 빌드할 것은
+없다 — RFCOMM은 표준 라이브러리에서 온다. 먼저 `bluetoothctl`로 버즈를 페어링하고,
+자세한 내용은 [linux/README.md](linux/README.md)를 보면 된다.
+
+### Windows
+
+```bat
+git clone https://github.com/id6917824/galaxy-buds-multipoint
+cd galaxy-buds-multipoint\windows
+budsmp apply
+```
+
+Python 3.9 이상만 있으면 된다. 관리자 권한도, 빌드 과정도 필요 없다. 먼저 설정에서
+버즈를 페어링하고, 자세한 내용은 [windows/README.md](windows/README.md)를 보면 된다.
+
 ### 프로토콜 도구
 
 프레임 빌더와 디코더는 Python 3만 있으면 어디서든 동작한다. 의존성은 없다.
@@ -127,7 +155,6 @@ python3 -m budsmp.frame selftest                               # 캡처한 바�
   다른 쪽이 멈출 때까지 스트림을 가져오지 않는다. 결함이 아니라 일반적인 멀티포인트
   중재 동작이다.
 - 버즈 초기화 시 초기화된다.
-- 지금은 macOS만 지원한다.
 
 ## 면책
 
@@ -145,10 +172,10 @@ python3 -m budsmp.frame selftest                               # 캡처한 바�
 
 제보하면 도움이 되는 것들:
 
+- **Linux나 Windows 도구가 동작했는지.** 둘 다 구현은 끝났지만 실제 버즈로는 검증되지
+  않았다. "동작했다" 또는 "이 로그와 함께 실패했다" 한 줄이 지금 가장 도움이 된다.
 - 다른 Galaxy Buds 모델: `budsmp scan`에 `SPPSERVICE4`가 보이는지, `apply`가
   동작하는지. 모델명과 펌웨어 버전을 함께 적어 주면 좋다.
-- Linux와 Windows 전송 계층 — `python/budsmp/frame.py`의 프로토콜 계층은 완성되어
-  검증까지 끝났으므로, 남은 것은 소켓 배관 작업이다.
 
 로그를 올릴 때는 먼저 스크럽하자. `budsmp` 출력에는 본인의 블루투스 주소가 들어 있고,
 `read`는 삼성 계정 해시를 출력한다.

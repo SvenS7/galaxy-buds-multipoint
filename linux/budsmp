@@ -1,0 +1,21 @@
+#!/bin/sh
+# budsmp — Galaxy Buds multipoint enabler (Linux)
+#
+# A thin wrapper so you can run ./budsmp from this directory. It is equivalent to
+#     PYTHONPATH=../python python3 -m budsmp "$@"
+# and exists only to save the typing; there is nothing to build or install.
+
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHONPATH="$here/../python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1; then
+        exec "$py" -m budsmp "$@"
+    fi
+done
+
+echo "budsmp: no python3 in PATH (Python 3.9 or newer is required)" >&2
+exit 1

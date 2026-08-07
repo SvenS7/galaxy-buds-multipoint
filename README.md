@@ -25,11 +25,17 @@ puts it back exactly as it was.
 
 ## Status
 
-| platform | state |
-|---|---|
-| macOS | working, verified on hardware |
-| Linux | planned — `AF_BLUETOOTH` / `BTPROTO_RFCOMM` |
-| Windows | planned — `AF_BTH` / `BTHPROTO_RFCOMM` |
+| platform | state | how |
+|---|---|---|
+| macOS 11+ | working, verified on hardware | Swift + IOBluetooth, in [macos/](macos/) |
+| Linux | implemented, not yet run against buds | Python + `AF_BLUETOOTH`, in [linux/](linux/) |
+| Windows 10+ | implemented, not yet run against buds | Python + `AF_BTH`, in [windows/](windows/) |
+
+"Not yet run against buds" is meant literally. The Linux and Windows tools build
+byte-for-byte the same frames as the macOS one, checked against frames captured
+from real hardware, and their socket, discovery and reporting paths have their own
+tests — but nobody has yet pointed them at actual buds. If you try it, please say
+whether it worked.
 
 Developed and confirmed on Galaxy Buds2 Pro. The mechanism is not model-specific
 and should apply to other Galaxy Buds that advertise `SPPSERVICE4`, but that is
@@ -89,15 +95,38 @@ If `apply` cannot open the channel, the buds are asleep: take them out of the
 case, select them as the audio output device, start playing something, and retry.
 See [macos/README.md](macos/README.md) for the rest of the failure modes.
 
+### Linux
+
+```bash
+git clone https://github.com/id6917824/galaxy-buds-multipoint
+cd galaxy-buds-multipoint/linux
+./budsmp apply
+```
+
+Needs Python 3.9+ and BlueZ, both of which a desktop Linux already has. Nothing
+to build — RFCOMM comes from the standard library. Pair the buds first
+(`bluetoothctl`), then see [linux/README.md](linux/README.md).
+
+### Windows
+
+```bat
+git clone https://github.com/id6917824/galaxy-buds-multipoint
+cd galaxy-buds-multipoint\windows
+budsmp apply
+```
+
+Needs Python 3.9+ and nothing else — no administrator rights, no build step. Pair
+the buds in Settings first, then see [windows/README.md](windows/README.md).
+
 ### Protocol tools
 
 The frame builder and decoder work anywhere Python 3 runs, with no dependencies:
 
 ```bash
 cd python
-python3 -m budsmp.frame version-only 2                        # build the fix frame
-python3 -m budsmp.frame decode fc0b00014304030400000b021eafcc  # take it apart
-python3 -m budsmp.frame selftest                              # check against captured bytes
+python3 -m budsmp.frame version-only 2                         # build the fix frame
+python3 -m budsmp.frame decode fc0b00014304030400000b021eafcc   # take it apart
+python3 -m budsmp.frame selftest                               # check against captured bytes
 ```
 
 ## Is this safe?
@@ -129,7 +158,6 @@ the same thing they were doing before the fix, and which the next write undoes.
   does not steal the stream until the other one stops. Normal multipoint
   arbitration, not a defect.
 - A buds factory reset clears it.
-- macOS only, for now.
 
 ## Disclaimer
 
@@ -147,10 +175,11 @@ update. Provided as is, with no warranty — see [LICENSE](LICENSE).
 
 Useful things to report:
 
+- **Did the Linux or Windows tool work?** Both are written but unproven against
+  real buds; a "worked" or "failed with this log" is the most useful thing anyone
+  can send right now.
 - Other Galaxy Buds models: does `budsmp scan` show `SPPSERVICE4`, and does
   `apply` work? Include the model and firmware version.
-- Linux and Windows transports — the protocol layer in `python/budsmp/frame.py`
-  is done and tested, so what is left is the socket plumbing.
 
 When posting logs, scrub them first. `budsmp` output contains your Bluetooth
 addresses, and `read` prints your Samsung account hash.
