@@ -224,11 +224,13 @@ def parse_hex(s: str) -> bytes:
 # Reporting
 # ---------------------------------------------------------------------------
 
-def _majority(values):
-    """Most-seen value, which survives a truncated frame at the tail better than
-    simply taking the last one."""
-    counts = Counter(values)
-    return counts.most_common(1)[0][0] if counts else None
+def _current(values):
+    """The newest report. Frames arrive in order on a reliable stream, and a
+    truncated one fails to decode rather than contributing a stale value, so the
+    last decoded frame is the current state. (A majority vote loses here: a write
+    produces frames for the record as it was *and* as it now is, and 2-2 ties made
+    it report the pre-write value as the result.)"""
+    return values[-1] if values else None
 
 
 def report_state(rx: bytes, expecting: int | None, tone: WakeTone | None,
@@ -249,8 +251,9 @@ def report_state(rx: bytes, expecting: int | None, tone: WakeTone | None,
             finish(EXIT_NOT_VERIFIED, "no state frame to verify against", tone)
         finish(EXIT_OK if wrote else EXIT_NOT_VERIFIED, "no state frame", tone)
 
-    as_ver = _majority(s.as_ver for s in states)
-    declared = _majority(s.declared_account for s in states)
+    seen = [s.as_ver for s in states]
+    as_ver = _current(seen)
+    declared = _current([s.declared_account for s in states])
     peers = [a for a, _ in Counter(a for s in states for a in s.peer_accounts).most_common()]
 
     if not wrote:
@@ -258,6 +261,11 @@ def report_state(rx: bytes, expecting: int | None, tone: WakeTone | None,
     LOG(f"  state frames       : {len(states)}")
     verdict = "[multipoint allowed]" if frame.multipoint_allowed(as_ver) else "[multipoint blocked]"
     LOG(f"  asVer (this host)  : {as_ver}   {verdict}")
+    if len(set(seen)) > 1:
+        # The frames the buds send around a write trace the record before and
+        # after it, so the first value is what was actually stored beforehand.
+        LOG("  asVer as reported  : " + " -> ".join(str(v) for v in seen))
+        LOG("                       (first value is what was stored before the write)")
     none_note = "   [none — expected, and fine]" if declared == 0 else ""
     LOG(f"  account declared   : 0x{declared:04x}{none_note}")
     if peers:

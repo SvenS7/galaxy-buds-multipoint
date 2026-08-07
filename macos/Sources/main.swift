@@ -172,24 +172,33 @@ func smepParse(_ s: [UInt8]) -> [SmepFrame] {
 //   "eb 1a 00" + 2 bytes: account hash of the other peer      (little-endian)
 
 struct DeviceState {
-    var asVer: UInt8?
-    var declaredAccount: UInt16?
+    /// Every asVer seen, in arrival order. A write produces frames for the record
+    /// as it was *and* as it now is, so this is a before/after trace rather than
+    /// a set of readings to average.
+    var asVerSeen: [UInt8] = []
+    var declaredSeen: [UInt16] = []
     var peerAccounts: [UInt16] = []
     var frameCount = 0
+
+    /// The newest report. Frames arrive in order on a reliable stream, and a
+    /// truncated one fails to decode rather than contributing a stale value, so
+    /// the last decoded frame is the current state.
+    var asVer: UInt8? { asVerSeen.last }
+    var declaredAccount: UInt16? { declaredSeen.last }
+    /// True when the frames disagree — normal right after a write.
+    var asVerChanged: Bool { Set(asVerSeen).count > 1 }
 }
 
 func decodeState(_ rx: [UInt8]) -> DeviceState {
     var st = DeviceState()
-    var asVerVotes = [UInt8: Int]()
-    var declVotes = [UInt16: Int]()
     var peerVotes = [UInt16: Int]()
 
     for f in smepParse(rx) {
         let p = f.payload
         guard p.count >= 10, p[0] == 0x02, p[1] == 0x05, p[2] == 0x4c, p[3] == MDE_VERSION_OPCODE else { continue }
         st.frameCount += 1
-        asVerVotes[p[6], default: 0] += 1
-        declVotes[UInt16(p[9]) << 8 | UInt16(p[8]), default: 0] += 1
+        st.asVerSeen.append(p[6])
+        st.declaredSeen.append(UInt16(p[9]) << 8 | UInt16(p[8]))
         var k = 0
         while k + 4 < p.count {
             if p[k] == 0xeb && p[k + 1] == 0x1a && p[k + 2] == 0x00 {
@@ -198,10 +207,6 @@ func decodeState(_ rx: [UInt8]) -> DeviceState {
             k += 1
         }
     }
-    // Later frames reflect the newest record state, but a simple majority is
-    // more robust against a half-received frame at the tail of the stream.
-    st.asVer = asVerVotes.max { $0.value < $1.value }?.key
-    st.declaredAccount = declVotes.max { $0.value < $1.value }?.key
     st.peerAccounts = peerVotes.sorted { $0.value > $1.value }.map { $0.key }
     return st
 }
@@ -446,7 +451,11 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
     }
 
     func rfcommChannelClosed(_ ch: IOBluetoothRFCOMMChannel!) {
+        // Nothing more can arrive, so report now instead of sitting out the rest
+        // of the listen window. This is the normal ending when the buds drop this
+        // host — which is exactly what a failing gate looks like.
         log("channel closed by peer")
+        complete()
     }
 
     private func complete() {
@@ -652,6 +661,13 @@ func reportState(_ rx: [UInt8], expecting asVer: UInt8?, wrote: Bool = true) -> 
     log("  state frames       : \(state.frameCount)")
     if let v = state.asVer {
         log("  asVer (this host)  : \(v)   \((v == 2 || v == 3) ? "[multipoint allowed]" : "[multipoint blocked]")")
+    }
+    if state.asVerChanged {
+        // The frames the buds send around a write trace the record before and
+        // after it, so the first value is what was actually stored beforehand.
+        let seq = state.asVerSeen.map(String.init).joined(separator: " -> ")
+        log("  asVer as reported  : \(seq)")
+        log("                       (first value is what was stored before the write)")
     }
     if let a = state.declaredAccount {
         log(String(format: "  account declared   : 0x%04x%@", a, a == 0 ? "   [none — expected, and fine]" : ""))
