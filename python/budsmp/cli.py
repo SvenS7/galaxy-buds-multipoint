@@ -26,7 +26,7 @@ EXIT_OPEN_FAILED = 3
 EXIT_TIMEOUT = 4
 EXIT_NOT_VERIFIED = 5
 
-KNOWN_COMMANDS = ("apply", "revert", "read", "send", "scan", "sdp", "frame", "help")
+KNOWN_COMMANDS = ("apply", "revert", "read", "watch", "send", "scan", "sdp", "frame", "help")
 
 USAGE = """budsmp — enable Galaxy Buds multipoint on a non-Galaxy host
 
@@ -39,6 +39,10 @@ COMMANDS
   revert           Write asVer=0, restoring the stock account-gated behaviour.
   read             Read back the stored device state (asVer, account hashes).
                    Writes --asver first (default 2) to make the buds report.
+  watch            Listen without writing anything, and report whatever the buds
+                   push. The only command that measures the stored value rather
+                   than one it just wrote — use it to test whether asVer survived
+                   a reconnect or a power cycle.
   send <hex>...    Send raw SMEP frames, then listen.
   scan             List paired Bluetooth devices and their RFCOMM services.
   sdp              Query the target's SDP records and dump the channel map.
@@ -51,7 +55,7 @@ OPTIONS
   --asver <n>      Version byte to write (default 2; the gate accepts 2 or 3).
   --account <hhhh> Also overwrite the stored account hash (not needed; research).
   --selector <n>   Account selector byte used with --account (default 1).
-  --listen <sec>   Seconds to listen after sending.
+  --listen <sec>   Seconds to listen after sending (watch defaults to 45).
   --attempts <n>   RFCOMM open attempts (default 8).
   --retry <sec>    Delay between attempts (default 0.7).
   --no-wake        Skip the wake tone that keeps the buds' SPP server up.
@@ -131,6 +135,8 @@ class Options:
         self.wake_freq = DEFAULT_FREQ
         self.wake_amp = DEFAULT_AMP
         self.timeout = 60.0
+        # Whether --timeout was given. A long --listen otherwise trips the watchdog.
+        self.timeout_explicit = False
 
 
 def parse_options(args: list[str]) -> Options:
@@ -189,6 +195,7 @@ def parse_options(args: list[str]) -> Options:
             o.wake_amp = number(a, float, "an amplitude between 0 and 1")
         elif a == "--timeout":
             o.timeout = number(a, float, "seconds")
+            o.timeout_explicit = True
         elif a == "--log":
             o.log_path = value(a)
         elif a.startswith("-"):
@@ -224,23 +231,30 @@ def _majority(values):
     return counts.most_common(1)[0][0] if counts else None
 
 
-def report_state(rx: bytes, expecting: int | None, tone: WakeTone | None) -> "NoReturn":  # noqa: F821
+def report_state(rx: bytes, expecting: int | None, tone: WakeTone | None,
+                 wrote: bool = True) -> "NoReturn":  # noqa: F821
     states = frame.decode_state(rx)
     LOG()
     LOG("--- device state as reported by the buds --------------------------")
     if not states:
         LOG("  no 02 05 4c 0b state frame arrived.")
-        LOG("  the write may still have landed — re-run `budsmp read` with the buds")
-        LOG("  awake, or start/stop playback to force the record to be re-evaluated.")
+        if wrote:
+            LOG("  the write may still have landed — re-run `budsmp read` with the buds")
+            LOG("  awake, or start/stop playback to force the record to be re-evaluated.")
+        else:
+            LOG("  the buds only push their state when something makes them re-evaluate")
+            LOG("  the record. Re-run and start or stop playback while it listens.")
         LOG("------------------------------------------------------------------")
         if expecting is not None:
             finish(EXIT_NOT_VERIFIED, "no state frame to verify against", tone)
-        finish(EXIT_OK, "no state frame", tone)
+        finish(EXIT_OK if wrote else EXIT_NOT_VERIFIED, "no state frame", tone)
 
     as_ver = _majority(s.as_ver for s in states)
     declared = _majority(s.declared_account for s in states)
     peers = [a for a, _ in Counter(a for s in states for a in s.peer_accounts).most_common()]
 
+    if not wrote:
+        LOG("  (nothing was written — this is the stored value)")
     LOG(f"  state frames       : {len(states)}")
     verdict = "[multipoint allowed]" if frame.multipoint_allowed(as_ver) else "[multipoint blocked]"
     LOG(f"  asVer (this host)  : {as_ver}   {verdict}")
@@ -336,6 +350,12 @@ def main(argv: list[str] | None = None) -> int:
         frames = [frame.version_only(o.as_ver)]
         expecting = None
         default_listen = 10.0
+    elif o.command == "watch":
+        # Deliberately empty: every other command writes before it reports, so the
+        # value it prints is one it just set. This one only ever observes.
+        frames = []
+        expecting = None
+        default_listen = 45.0
     elif o.command == "send":
         if not o.raw_frames:
             usage_error("send needs at least one hex frame")
@@ -364,18 +384,25 @@ def main(argv: list[str] | None = None) -> int:
         shown = discover.describe_services(device.address, LOG)
         finish(EXIT_OK, f"{shown} service record(s)")
 
+    seconds = o.listen if o.listen is not None else default_listen
+    # A long --listen would otherwise be cut short by the default watchdog.
+    deadline = o.timeout if o.timeout_explicit else max(o.timeout, seconds + 25)
+
     # A hard deadline, so a wedged Bluetooth stack cannot hang the tool forever.
     def bail():
-        LOG(f"RESULT: FAIL({EXIT_TIMEOUT}) timed out after {o.timeout}s")
+        LOG(f"RESULT: FAIL({EXIT_TIMEOUT}) timed out after {deadline}s")
         os._exit(EXIT_TIMEOUT)
 
-    watchdog = threading.Timer(o.timeout, bail)
+    watchdog = threading.Timer(deadline, bail)
     watchdog.daemon = True
     watchdog.start()
 
     tone: WakeTone | None = None
+    nudge: threading.Timer | None = None
     try:
         channel = discover.resolve_channel(device.address, o.channel, LOG)
+        if o.command == "watch":
+            LOG("watch: sending nothing — whatever arrives is what the buds already hold")
         if o.wake:
             tone = WakeTone(LOG, o.wake_freq, o.wake_amp)
             tone.start()
@@ -391,13 +418,31 @@ def main(argv: list[str] | None = None) -> int:
             finish(EXIT_OPEN_FAILED, str(exc), tone)
         try:
             session.send(frames)
-            seconds = o.listen if o.listen is not None else default_listen
             if seconds > 0:
-                LOG(f"frames sent; listening {seconds}s for device state ...")
+                what = "sending nothing" if not frames else "frames sent"
+                LOG(f"{what}; listening {seconds}s for device state ...")
+            if o.command == "watch":
+                # The buds push their state when a record is re-evaluated, and that
+                # happens on audio-connection changes. Since we refuse to write,
+                # ending the wake tone is the nudge — and if it is off, the user has
+                # to play or pause something instead.
+                if tone is None:
+                    LOG("  start or stop playback now to make the buds re-evaluate the record")
+                else:
+                    def drop_tone():
+                        LOG("watch: stopping the wake tone — the audio change should trigger a report")
+                        LOG("  (if nothing arrives, start or stop playback while this listens)")
+                        tone.stop()
+
+                    nudge = threading.Timer(2.0, drop_tone)
+                    nudge.daemon = True
+                    nudge.start()
             rx = session.listen(seconds)
         finally:
+            if nudge is not None:
+                nudge.cancel()
             session.close()
-        report_state(rx, expecting, tone)          # exits
+        report_state(rx, expecting, tone, wrote=bool(frames))   # exits
     except Unsupported as exc:
         finish(EXIT_OPEN_FAILED, str(exc), tone)
     except KeyboardInterrupt:

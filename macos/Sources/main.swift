@@ -363,6 +363,9 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
     private let attempts: Int
     private let retryDelay: Double
     private let onDone: ([UInt8]) -> Void
+    /// Runs once the channel is open and every frame has gone out. `watch` uses
+    /// it to drop the wake tone, which is itself the event the buds react to.
+    private let onListening: (() -> Void)?
 
     private var channel: IOBluetoothRFCOMMChannel?
     private var rx = [UInt8]()
@@ -375,6 +378,7 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
          listenSeconds: Double,
          attempts: Int,
          retryDelay: Double,
+         onListening: (() -> Void)? = nil,
          onDone: @escaping ([UInt8]) -> Void) {
         self.device = device
         self.channelID = channelID
@@ -382,6 +386,7 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
         self.listenSeconds = listenSeconds
         self.attempts = attempts
         self.retryDelay = retryDelay
+        self.onListening = onListening
         self.onDone = onDone
     }
 
@@ -419,7 +424,11 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
 
     private func sendNext() {
         guard sendIndex < frames.count else {
-            if listenSeconds > 0 { log("frames sent; listening \(listenSeconds)s for device state ...") }
+            if listenSeconds > 0 {
+                let what = frames.isEmpty ? "sending nothing" : "frames sent"
+                log("\(what); listening \(listenSeconds)s for device state ...")
+            }
+            onListening?()
             DispatchQueue.main.asyncAfter(deadline: .now() + listenSeconds) { self.complete() }
             return
         }
@@ -470,6 +479,8 @@ struct Options {
     var wakeFreq = 19_000.0
     var wakeAmp: Float = 0.02
     var timeout = 60.0
+    /// Whether --timeout was given. A long --listen otherwise trips the watchdog.
+    var timeoutExplicit = false
 }
 
 let usage = """
@@ -484,6 +495,10 @@ COMMANDS
   revert           Write asVer=0, restoring the stock account-gated behaviour.
   read             Read back the stored device state (asVer, account hashes).
                    Writes --asver first (default 2) to make the buds report.
+  watch            Listen without writing anything, and report whatever the buds
+                   push. The only command that measures the stored value rather
+                   than one it just wrote — use it to test whether asVer survived
+                   a reconnect or a power cycle.
   send <hex>...    Send raw SMEP frames, then listen.
   scan             List paired Bluetooth devices and their RFCOMM services.
   sdp              Run a fresh SDP query on the target and dump the channel map.
@@ -496,7 +511,7 @@ OPTIONS
   --asver <n>      Version byte to write (default 2; the gate accepts 2 or 3).
   --account <hhhh> Also overwrite the stored account hash (not needed; research).
   --selector <n>   Account selector byte used with --account (default 1).
-  --listen <sec>   Seconds to listen after sending.
+  --listen <sec>   Seconds to listen after sending (watch defaults to 45).
   --attempts <n>   RFCOMM open attempts (default 8).
   --retry <sec>    Delay between attempts (default 0.7).
   --no-wake        Skip the wake tone that keeps the buds' SPP server up.
@@ -511,7 +526,7 @@ EXIT CODES
   4 timeout        5 sent but could not verify the new state
 """
 
-let KNOWN_COMMANDS: Set<String> = ["apply", "revert", "read", "send", "scan", "sdp", "frame", "help"]
+let KNOWN_COMMANDS: Set<String> = ["apply", "revert", "read", "watch", "send", "scan", "sdp", "frame", "help"]
 
 func parseOptions(_ args: [String]) -> Options {
     var o = Options()
@@ -545,7 +560,9 @@ func parseOptions(_ args: [String]) -> Options {
         case "--no-wake":           o.wake = false
         case "--wake-freq":         o.wakeFreq = Double(value(&i, a)) ?? 19_000
         case "--wake-vol":          o.wakeAmp = Float(value(&i, a)) ?? 0.02
-        case "--timeout":           o.timeout = Double(value(&i, a)) ?? 60
+        case "--timeout":
+            o.timeout = Double(value(&i, a)) ?? 60
+            o.timeoutExplicit = true
         case "--log":               o.logPath = value(&i, a)
         default:
             if a.hasPrefix("-psn_") { break }        // LaunchServices leftover
@@ -614,18 +631,24 @@ final class SdpDumper: NSObject {
 }
 
 /// Print what the buds report about their stored record, and verify the write.
-func reportState(_ rx: [UInt8], expecting asVer: UInt8?) -> Never {
+func reportState(_ rx: [UInt8], expecting asVer: UInt8?, wrote: Bool = true) -> Never {
     let state = decodeState(rx)
     log("")
     log("--- device state as reported by the buds --------------------------")
     if state.frameCount == 0 {
         log("  no 02 05 4c 0b state frame arrived.")
-        log("  the write may still have landed — re-run `budsmp read` with the buds")
-        log("  awake, or start/stop playback to force the record to be re-evaluated.")
+        if wrote {
+            log("  the write may still have landed — re-run `budsmp read` with the buds")
+            log("  awake, or start/stop playback to force the record to be re-evaluated.")
+        } else {
+            log("  the buds only push their state when something makes them re-evaluate")
+            log("  the record. Re-run and start or stop playback while it listens.")
+        }
         log("------------------------------------------------------------------")
         if asVer != nil { finish(.notVerified, "no state frame to verify against") }
-        finish(.ok, "no state frame")
+        finish(wrote ? .ok : .notVerified, "no state frame")
     }
+    if !wrote { log("  (nothing was written — this is the stored value)") }
     log("  state frames       : \(state.frameCount)")
     if let v = state.asVer {
         log("  asVer (this host)  : \(v)   \((v == 2 || v == 3) ? "[multipoint allowed]" : "[multipoint blocked]")")
@@ -720,6 +743,13 @@ case "read":
     expectedVersion = nil
     defaultListen = 10.0
 
+case "watch":
+    // Deliberately empty: every other command writes before it reports, so the
+    // value it prints is one it just set. This one only ever observes.
+    framesToSend = []
+    expectedVersion = nil
+    defaultListen = 45.0
+
 case "send":
     guard !opts.rawFrames.isEmpty else {
         print(usage)
@@ -738,22 +768,46 @@ default:
 }
 
 let channelID = resolveChannel(device, override: opts.channel)
+let listenSeconds = opts.listenSeconds ?? defaultListen
+// A long --listen would otherwise be cut short by the default watchdog.
+let watchdog = opts.timeoutExplicit ? opts.timeout : max(opts.timeout, listenSeconds + 25)
 
 if opts.wake {
     tone = WakeTone(freq: opts.wakeFreq, amp: opts.wakeAmp)
     tone?.start()
 }
 
+var onListening: (() -> Void)?
+if opts.command == "watch" {
+    log("watch: sending nothing — whatever arrives is what the buds already hold")
+    onListening = {
+        // The buds push their state when a record is re-evaluated, and that
+        // happens on audio-connection changes. Since we refuse to write, ending
+        // the wake tone is the nudge — and if it is off, the user has to play or
+        // pause something instead.
+        guard tone != nil else {
+            log("  start or stop playback now to make the buds re-evaluate the record")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            log("watch: stopping the wake tone — the audio change should trigger a report")
+            log("  (if nothing arrives, start or stop playback while this listens)")
+            tone?.stop()
+        }
+    }
+}
+
 let session = Session(device: device,
                       channelID: channelID,
                       frames: framesToSend,
-                      listenSeconds: opts.listenSeconds ?? defaultListen,
+                      listenSeconds: listenSeconds,
                       attempts: opts.attempts,
-                      retryDelay: opts.retryDelay) { rx in
+                      retryDelay: opts.retryDelay,
+                      onListening: onListening) { rx in
     tone?.stop()
-    reportState(rx, expecting: expectedVersion)
+    reportState(rx, expecting: expectedVersion, wrote: !framesToSend.isEmpty)
 }
 
 DispatchQueue.main.async { session.start() }
-DispatchQueue.main.asyncAfter(deadline: .now() + opts.timeout) { finish(.timeout, "timed out") }
+DispatchQueue.main.asyncAfter(deadline: .now() + watchdog) { finish(.timeout, "timed out") }
 RunLoop.main.run()

@@ -52,6 +52,7 @@ unsigned bundle would re-prompt on every rebuild.
 | `apply` | Write `asVer=2`, then read the state back to confirm it landed. |
 | `revert` | Write `asVer=0`, restoring stock behaviour. |
 | `read` | Report the stored `asVer` and account hashes. Writes `--asver` (default 2) first, because the buds only report when a record is re-evaluated. |
+| `watch` | Listen without writing anything and report what the buds push. The only command that shows the *stored* value rather than one it just wrote. |
 | `send <hex>...` | Send raw SMEP frames and listen. |
 | `scan` | List paired devices and their RFCOMM services. |
 | `sdp` | Fresh SDP query on the target; prints the channel map. |
