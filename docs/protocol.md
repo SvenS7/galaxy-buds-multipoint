@@ -199,4 +199,10 @@ So `apply` is a per-power-session command, not a one-time patch: run it whenever
 buds have powered on. Two other things clear the byte through the same reset —
 giving a device a record for the first time, and fully releasing one — so removing
 and re-adding your computer costs a write as well. See
-[experiments.md](experiments.md#does-the-write-persist) for the measurement.
+[experiments.md](experiments.md#does-the-write-persist) for the measurement, and
+[asver-lifetime.md](asver-lifetime.md) for the full account: every instruction that
+can write the byte, every path that clears it, and why no sequence of frames makes
+it durable.
+
+On macOS you can hand the re-applying to a background agent instead of remembering
+it — see [macos/README.md](../macos/README.md#keeping-it-applied).
