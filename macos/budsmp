@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# budsmp — thin wrapper around build/BudsMP.app
+#
+# The tool has to run as a .app through LaunchServices to get the Bluetooth
+# permission prompt (see build.sh). That means its stdout/stderr do not reach
+# this terminal, so the app writes everything to a log file and this script
+# prints it and turns the app's RESULT line back into an exit code.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP="${HERE}/build/BudsMP.app"
+BIN="${APP}/Contents/MacOS/BudsMP"
+LOG="${BUDSMP_LOG:-${HOME}/Library/Logs/galaxy-buds-multipoint.log}"
+
+if [[ ! -x "$BIN" ]]; then
+  echo "budsmp: building ..." >&2
+  "${HERE}/build.sh" >&2 || exit 1
+fi
+
+# These never touch Bluetooth, so run them straight and keep normal stdio.
+for arg in "$@"; do
+  case "$arg" in
+    help|-h|--help|frame) exec "$BIN" "$@" ;;
+  esac
+done
+
+# Respect a caller-supplied --log; otherwise inject ours so we know what to print.
+inject_log=1
+for arg in "$@"; do
+  [[ "$arg" == "--log" ]] && { inject_log=0; break; }
+done
+
+mkdir -p "$(dirname "$LOG")"
+: > "$LOG"
+
+# The very first run blocks inside IOBluetooth until the Bluetooth privacy
+# prompt is answered, and the prompt is easy to miss behind other windows.
+if [[ ! -f "${HERE}/build/.tcc-granted" ]]; then
+  echo "budsmp: if macOS asks for Bluetooth access, click Allow (it only asks once)." >&2
+fi
+
+if [[ $inject_log -eq 1 ]]; then
+  set -- --log "$LOG" "$@"
+fi
+
+# `open -W` prints "Unable to block on application" when the app exits before it
+# can attach — harmless, and pure noise for short runs. Filter just that line.
+launch_err="$(open -W -n -a "$APP" --args "$@" 2>&1 >/dev/null)"
+open_rc=$?
+printf '%s' "$launch_err" | grep -v 'Unable to block on application' | grep -v '^[[:space:]]*$' >&2 || true
+
+if [[ $open_rc -ne 0 ]]; then
+  echo "budsmp: could not launch ${APP} (open exited ${open_rc})" >&2
+  exit 70
+fi
+
+if [[ ! -s "$LOG" ]]; then
+  cat >&2 <<'MSG'
+budsmp: the app produced no output.
+
+This usually means macOS blocked it before it ran. Check
+System Settings -> Privacy & Security -> Bluetooth and allow "BudsMP",
+then run this command again.
+MSG
+  exit 71
+fi
+
+cat "$LOG"
+
+# Bluetooth clearly worked, so stop nagging about the prompt on later runs.
+touch "${HERE}/build/.tcc-granted" 2>/dev/null || true
+
+result="$(grep -m1 '^RESULT: ' "$LOG" || true)"
+case "$result" in
+  "RESULT: OK"*)   exit 0 ;;
+  "RESULT: FAIL"*)
+    code="$(printf '%s' "$result" | sed -n 's/^RESULT: FAIL(\([0-9]*\)).*/\1/p')"
+    exit "${code:-1}"
+    ;;
+  *) exit 72 ;;   # ran, but never reached a verdict
+esac
