@@ -31,6 +31,10 @@ RAM에 있기 때문이에요. 그래서 케이스에 한동안 넣어 뒀다면
 [docs/experiments.md](docs/experiments.md#does-the-write-persist)에 적어 뒀습니다.
 아예 되돌리고 싶으면 `./budsmp revert`로 원래 값 그대로 복구할 수 있어요.
 
+macOS라면 이걸 매번 기억할 필요는 없습니다. `macos/install-agent.sh`가 백그라운드
+에이전트를 등록해서, 버즈가 연결될 때마다 알아서 프레임을 써 줍니다.
+[Keeping it applied](macos/README.md#keeping-it-applied)를 보세요.
+
 ## 지원 현황
 
 | 플랫폼 | 상태 | 구현 |
@@ -78,8 +82,11 @@ RAM에 있기 때문이에요. 그래서 케이스에 한동안 넣어 뒀다면
 넣었을 때는 끊겼습니다. 방법과 결과는 [docs/experiments.md](docs/experiments.md)에
 정리해 뒀어요.
 
-더 깊이 들어가고 싶다면 와이어 포맷은 [docs/protocol.md](docs/protocol.md), 펌웨어
-쪽은 [docs/firmware-gate.md](docs/firmware-gate.md)를 보시면 됩니다.
+더 깊이 들어가고 싶다면 와이어 포맷은 [docs/protocol.md](docs/protocol.md), 게이트
+자체는 [docs/firmware-gate.md](docs/firmware-gate.md), 그리고
+[docs/asver-lifetime.md](docs/asver-lifetime.md)는 그 한 바이트를 펌웨어 안에서
+끝까지 따라갑니다 — 무엇이 값을 쓸 수 있고, 무엇이 지우고, 왜 호스트 쪽에서는 영구히
+고정할 수 없는지까지.
 
 ## 설치하고 실행하기
 
@@ -105,6 +112,21 @@ Xcode 커맨드 라인 도구(`xcode-select --install`) 말고는 필요한 게 
 `apply`가 채널을 열지 못하면 버즈가 자고 있는 거예요. 케이스에서 꺼내고, 오디오 출력
 장치로 선택한 다음 아무거나 재생하고 다시 시도해 보세요. 나머지 실패 상황은
 [macos/README.md](macos/README.md)에 정리해 뒀습니다.
+
+한 번 잘 되고 나면, 이걸로 계속 유지할 수 있습니다:
+
+```bash
+./install-agent.sh
+```
+
+sudo도 로그인 항목도 필요 없는 사용자 단위 LaunchAgent예요. 버즈가 연결되는 걸
+지켜보다가 그때마다 프레임을 하나 보냅니다. `./install-agent.sh uninstall`로 제거.
+
+한 가지만 기억하세요. Bluetooth 권한 프롬프트는 사람이 눌러야 하고, 백그라운드
+에이전트는 그걸 띄울 수 없습니다. `build.sh`로 다시 빌드하면 ad-hoc 서명이 바뀌어
+macOS가 다른 앱으로 취급하니, **재빌드했다면 `./budsmp apply`를 한 번 손으로 실행해
+허용을 누른 뒤 `./install-agent.sh`를 다시 실행**해 주세요. 그렇지 않으면 에이전트가
+권한을 기다리다 20초 뒤 로그를 남기고 종료하는 걸 반복합니다.
 
 ### Linux
 
@@ -171,8 +193,10 @@ python3 -m budsmp.frame selftest                               # 캡처한 바�
   뒤에는 `apply`를 다시 실행해야 합니다. 호스트 쪽 우회로는 없습니다. 레코드가 부팅 때
   지워지는 RAM에 있고, 재연결할 때 레코드를 복원하는 루틴이 이 바이트만 일부러 건드리지
   않아요. 계정 해시는 복원하면서 `asVer`는 원래 값을 그대로 되쓰기만 합니다. 고정하려면
-  펌웨어를 바꿔야 해요. 측정 결과와 주소는
-  [docs/experiments.md](docs/experiments.md#does-the-write-persist)에 있습니다.
+  펌웨어를 바꿔야 해요. 측정 결과는
+  [docs/experiments.md](docs/experiments.md#does-the-write-persist), 주소와 근거는
+  [docs/asver-lifetime.md](docs/asver-lifetime.md)에 있습니다. macOS라면
+  [백그라운드 에이전트](macos/README.md#keeping-it-applied)가 대신 해 줍니다.
 - 실행한 호스트만 고쳐져요. 컴퓨터가 두 대면 각각 한 번씩 실행해야 합니다.
 - 버즈가 유지하는 활성 링크는 2개고, 이 픽스가 그 상한을 올려 주지는 않아요.
 - 오디오는 실제로 재생 중인 기기를 따라갑니다. 쉬고 있는 기기에서 재생을 시작해도 다른

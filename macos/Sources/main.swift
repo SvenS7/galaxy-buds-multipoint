@@ -26,17 +26,36 @@ final class Logger {
     private var fh: FileHandle?
     private let q = DispatchQueue(label: "budsmp.log")
 
+    /// Prefix every line with a wall-clock time. Off for one-shot commands, whose
+    /// output the wrapper prints immediately; on for the daemon, where a line's
+    /// only useful context is when it happened.
+    var stamped = false
+    private lazy var clock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f
+    }()
+
     init(path: String?) {
         guard let path = path else { return }
         let dir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: path, contents: nil)
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
         fh = FileHandle(forWritingAtPath: path)
+        // Append rather than truncate: the daemon runs under launchd with
+        // KeepAlive, and wiping the log on every restart would throw away the
+        // history `install-agent.sh status` exists to show. One-shot runs still
+        // show only their own output, because the budsmp wrapper empties its log
+        // before launching the app.
+        fh?.seekToEndOfFile()
     }
 
     func write(_ s: String) {
-        guard let d = (s + "\n").data(using: .utf8) else { return }
         q.sync {
+            let line = stamped ? "\(clock.string(from: Date()))  \(s)\n" : s + "\n"
+            guard let d = line.data(using: .utf8) else { return }
             fh?.write(d)
             FileHandle.standardError.write(d)
         }
@@ -314,6 +333,14 @@ func serviceRecords(_ dev: IOBluetoothDevice) -> [IOBluetoothSDPServiceRecord] {
     (dev.services as? [IOBluetoothSDPServiceRecord]) ?? []
 }
 
+/// IOBluetooth reports addresses as `xx-xx-…` while everyone types `XX:XX:…`,
+/// so compare them stripped of both separators.
+func normalizedAddress(_ s: String?) -> String {
+    (s ?? "").lowercased()
+        .replacingOccurrences(of: ":", with: "")
+        .replacingOccurrences(of: "-", with: "")
+}
+
 func rfcommChannel(of record: IOBluetoothSDPServiceRecord) -> BluetoothRFCOMMChannelID? {
     var id: BluetoothRFCOMMChannelID = 0
     return record.getRFCOMMChannelID(&id) == kIOReturnSuccess ? id : nil
@@ -371,6 +398,10 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
     /// Runs once the channel is open and every frame has gone out. `watch` uses
     /// it to drop the wake tone, which is itself the event the buds react to.
     private let onListening: (() -> Void)?
+    /// What to do when the channel cannot be opened. The one-shot commands exit
+    /// with a status; the daemon logs and waits for the next connect event, so it
+    /// passes its own handler.
+    private let onFailure: ((Exit, String) -> Void)?
 
     private var channel: IOBluetoothRFCOMMChannel?
     private var rx = [UInt8]()
@@ -384,6 +415,7 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
          attempts: Int,
          retryDelay: Double,
          onListening: (() -> Void)? = nil,
+         onFailure: ((Exit, String) -> Void)? = nil,
          onDone: @escaping ([UInt8]) -> Void) {
         self.device = device
         self.channelID = channelID
@@ -392,6 +424,7 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
         self.attempts = attempts
         self.retryDelay = retryDelay
         self.onListening = onListening
+        self.onFailure = onFailure
         self.onDone = onDone
     }
 
@@ -417,10 +450,18 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
         }
 
         log("")
-        log("could not open RFCOMM channel \(channelID).")
-        log("the buds only run their SPP server while awake — take them out of the")
-        log("case, make them the audio output device, start playback, and retry.")
-        finish(.openFailed, "rfcomm open failed after \(total) attempts")
+        log("could not open RFCOMM channel \(channelID) after \(total) attempts.")
+        if onFailure == nil {
+            log("the buds only run their SPP server while awake — take them out of the")
+            log("case, make them the audio output device, start playback, and retry.")
+        }
+        fail(.openFailed, "rfcomm open failed after \(total) attempts")
+    }
+
+    /// Exit, unless a caller asked to be told instead.
+    private func fail(_ code: Exit, _ msg: String) {
+        guard let onFailure = onFailure else { finish(code, msg) }
+        onFailure(code, msg)
     }
 
     func rfcommChannelOpenComplete(_ ch: IOBluetoothRFCOMMChannel!, status error: IOReturn) {
@@ -468,6 +509,235 @@ final class Session: NSObject, IOBluetoothRFCOMMChannelDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// MARK: - Daemon
+// ---------------------------------------------------------------------------
+//
+// The buds clear `asVer` every time they power down (docs/experiments.md), so the
+// fix is a per-power-session command rather than a one-off. Every power session
+// begins with a connection, so re-sending the frame on connect covers all of them
+// without anyone having to remember. IOBluetooth delivers connect events to any
+// process running a run loop, which is why this needs no polling.
+
+/// Connect notifications fire as soon as the ACL link is up, which is a moment
+/// before the buds' SPP server will accept anything.
+let DAEMON_CONNECT_DELAY = 2.5
+
+/// How long to wait for the Bluetooth authorization check inside IOBluetooth
+/// before concluding that nothing is going to answer it. Generous, because a cold
+/// bluetoothd can take a few seconds on its own.
+let DAEMON_TCC_PATIENCE = 20.0
+
+final class Daemon: NSObject {
+    private let opts: Options
+    private let wake: Bool
+
+    private var connectNote: IOBluetoothUserNotification?
+    private var disconnectNotes = [String: IOBluetoothUserNotification]()
+    /// The RFCOMM open is synchronous and the buds run a single SPPSERVICE4
+    /// server, so only one write may be in flight.
+    private var running = false
+    private var session: Session?
+    private var applySeq = 0
+    private var pending = Set<String>()
+    private var appliedAt = [String: Date]()
+
+    /// Set once the (potentially blocking) connect-notification registration has
+    /// returned. Read from the watchdog queue, so it is guarded by `flagLock`.
+    private var registeredFlag = false
+    private let flagLock = NSLock()
+    private var registered: Bool {
+        get { flagLock.lock(); defer { flagLock.unlock() }; return registeredFlag }
+        set { flagLock.lock(); registeredFlag = newValue; flagLock.unlock() }
+    }
+
+    init(opts: Options, wake: Bool) {
+        self.opts = opts
+        self.wake = wake
+    }
+
+    func start() {
+        let target = opts.address.map { "address \($0)" }
+            ?? "a paired device whose name contains \"\(opts.nameNeedle)\""
+        log("daemon: writing asVer=\(opts.asVer) whenever \(target) connects")
+        log("daemon: wake tone \(wake ? "on" : "off"), debounce \(opts.debounce)s")
+
+        // Registering brings up IOBluetoothCoreBluetoothCoordinator, which blocks
+        // on a semaphore until TCC has an answer about Bluetooth access. Launched
+        // by launchd there is nobody to answer a prompt, so instead of returning a
+        // failure this call simply never comes back. Say so from another queue
+        // rather than hanging in silence, then exit: launchd's KeepAlive brings the
+        // daemon back once the grant exists, which is the self-healing path.
+        armBluetoothWatchdog()
+        connectNote = IOBluetoothDevice.register(forConnectNotifications: self,
+                                                selector: #selector(deviceConnected(_:device:)))
+        registered = true
+        guard connectNote != nil else {
+            finish(.openFailed, "could not register for Bluetooth connect notifications")
+        }
+
+        // Installing the agent, logging in, or restarting the daemon all happen
+        // while the buds may already be connected — that connect event is gone.
+        for d in pairedDevices() where matches(d) && d.isConnected() {
+            log("daemon: \(label(d)) is already connected")
+            schedule(d, after: 1.0)
+        }
+        log("daemon: ready")
+    }
+
+    /// The main thread is about to be unavailable, so this has to run elsewhere.
+    private func armBluetoothWatchdog() {
+        DispatchQueue.global().asyncAfter(deadline: .now() + DAEMON_TCC_PATIENCE) { [weak self] in
+            guard let self = self, !self.registered else { return }
+            // One call per line, so the stamp lands on both.
+            log("daemon: Bluetooth access has not been granted to this build, "
+                + "and a background agent cannot ask for it.")
+            log("daemon: run ./budsmp apply in a terminal, click Allow, then "
+                + "./install-agent.sh — a rebuild needs the prompt answered again.")
+            finish(.openFailed, "no Bluetooth access; exiting so launchd can retry")
+        }
+    }
+
+    // MARK: notifications
+
+    @objc private func deviceConnected(_ note: IOBluetoothUserNotification!, device: IOBluetoothDevice!) {
+        // Every device on the machine is announced here, not just the buds.
+        guard let device = device, matches(device) else { return }
+        log("daemon: connected — \(label(device))")
+        schedule(device, after: DAEMON_CONNECT_DELAY)
+    }
+
+    @objc private func deviceDisconnected(_ note: IOBluetoothUserNotification!, device: IOBluetoothDevice!) {
+        note?.unregister()
+        guard let device = device else { return }
+        let key = key(device)
+        disconnectNotes[key] = nil
+        // The debounce is there to collapse duplicate connect notifications, not
+        // to throttle real reconnections: a trip to the case can be over in
+        // seconds, and that is exactly when the frame needs re-sending.
+        appliedAt[key] = nil
+        log("daemon: disconnected — \(label(device))")
+    }
+
+    // MARK: matching
+
+    private func key(_ dev: IOBluetoothDevice) -> String { normalizedAddress(dev.addressString) }
+
+    private func label(_ dev: IOBluetoothDevice) -> String {
+        "\"\(dev.name ?? "?")\" \(dev.addressString ?? "?")"
+    }
+
+    private func matches(_ dev: IOBluetoothDevice) -> Bool {
+        if let want = opts.address {
+            return !want.isEmpty && normalizedAddress(dev.addressString) == normalizedAddress(want)
+        }
+        return (dev.name ?? "").lowercased().contains(opts.nameNeedle.lowercased())
+    }
+
+    // MARK: applying
+
+    private func schedule(_ dev: IOBluetoothDevice, after delay: Double) {
+        let k = key(dev)
+        watchForDisconnect(dev, key: k)
+        guard !pending.contains(k) else { return }
+        if let last = appliedAt[k] {
+            let ago = Date().timeIntervalSince(last)
+            if ago < opts.debounce {
+                log("daemon: skipping — already written \(String(format: "%.0f", ago))s ago")
+                return
+            }
+        }
+        pending.insert(k)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self.apply(dev, key: k) }
+    }
+
+    private func watchForDisconnect(_ dev: IOBluetoothDevice, key: String) {
+        guard disconnectNotes[key] == nil else { return }
+        disconnectNotes[key] = dev.register(forDisconnectNotification: self,
+                                            selector: #selector(deviceDisconnected(_:device:)))
+    }
+
+    private func apply(_ dev: IOBluetoothDevice, key k: String, connectWait: Int = 3) {
+        pending.remove(k)
+        if running {
+            log("daemon: another write is in flight; retrying in 3s")
+            schedule(dev, after: 3.0)
+            return
+        }
+        guard dev.isConnected() else {
+            // Registering for connect notifications also delivers one for devices
+            // that were already connected, and a real event can land a beat
+            // before the link is up, so give it a moment before deciding.
+            guard connectWait > 0 else {
+                log("daemon: \(label(dev)) is not connected after all; nothing to write")
+                return
+            }
+            pending.insert(k)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.apply(dev, key: k, connectWait: connectWait - 1)
+            }
+            return
+        }
+
+        running = true
+        applySeq += 1
+        let seq = applySeq
+
+        if wake {
+            tone = WakeTone(freq: opts.wakeFreq, amp: opts.wakeAmp)
+            tone?.start()
+        }
+
+        let want = opts.asVer
+        let budget = opts.timeout
+        let frame = opts.account.map { mdeWithAccount(version: want, selector: opts.selector, hash: $0) }
+            ?? mdeVersionOnly(want)
+        // A connect event is precisely when the SPP server may still be coming
+        // up, so the daemon is more patient than the one-shot commands.
+        let s = Session(device: dev,
+                        channelID: resolveChannel(dev, override: opts.channel),
+                        frames: [frame],
+                        listenSeconds: opts.listenSeconds ?? 4.0,
+                        attempts: max(opts.attempts, 15),
+                        retryDelay: opts.retryDelay,
+                        onFailure: { [weak self] code, msg in
+                            self?.done(k, seq: seq, code, msg)
+                        }) { [weak self] rx in
+            let (code, msg) = describeState(rx, expecting: want, wrote: true)
+            self?.done(k, seq: seq, code, msg)
+        }
+        session = s
+
+        // Nothing else would ever release `running` if a session wedged.
+        DispatchQueue.main.asyncAfter(deadline: .now() + budget) { [weak self] in
+            self?.done(k, seq: seq, .timeout, "gave up after \(budget)s")
+        }
+        s.start()
+    }
+
+    private func done(_ k: String, seq: Int, _ code: Exit, _ msg: String) {
+        guard running, seq == applySeq else { return }
+        running = false
+        session = nil
+        tone?.stop()
+        tone = nil
+
+        switch code {
+        case .ok:
+            appliedAt[k] = Date()
+            log("daemon: written and verified — \(msg)")
+        case .notVerified:
+            // The frame went out; only the confirming NOTIFY did not arrive in
+            // time. Re-sending it on the next connect is harmless either way.
+            appliedAt[k] = Date()
+            log("daemon: written but not confirmed — \(msg)")
+        default:
+            log("daemon: failed — \(msg); waiting for the next connect")
+        }
+        log("")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MARK: - Options
 // ---------------------------------------------------------------------------
 
@@ -485,11 +755,17 @@ struct Options {
     var attempts = 8
     var retryDelay = 0.7
     var wake = true
+    /// Whether the wake tone was asked for either way. `daemon` leaves it off by
+    /// default — the buds are awake by definition when they have just connected,
+    /// and a background process should not seize the audio device.
+    var wakeExplicit = false
     var wakeFreq = 19_000.0
     var wakeAmp: Float = 0.02
     var timeout = 60.0
     /// Whether --timeout was given. A long --listen otherwise trips the watchdog.
     var timeoutExplicit = false
+    /// `daemon` only: how long a successful write suppresses another one.
+    var debounce = 8.0
 }
 
 let usage = """
@@ -502,6 +778,9 @@ COMMANDS
   apply            Write asVer=2 so the buds stop tearing down the other device.
                    This is the fix. It survives disconnects, but not the buds
                    powering down — run it again after they have been in the case.
+  daemon           Stay running and do the above every time the buds connect, so
+                   you never have to think about the power-cycle problem again.
+                   install-agent.sh sets this up to start at login.
   revert           Write asVer=0, restoring the stock account-gated behaviour.
   read             Read back the stored device state (asVer, account hashes).
                    Writes --asver first (default 2) to make the buds report.
@@ -525,9 +804,12 @@ OPTIONS
   --attempts <n>   RFCOMM open attempts (default 8).
   --retry <sec>    Delay between attempts (default 0.7).
   --no-wake        Skip the wake tone that keeps the buds' SPP server up.
+  --wake           Use the wake tone even in daemon mode, where it is off.
   --wake-freq <hz> Wake tone frequency (default 19000).
   --wake-vol <0-1> Wake tone amplitude (default 0.02).
-  --timeout <sec>  Hard timeout (default 60).
+  --timeout <sec>  Hard timeout (default 60; per write in daemon mode).
+  --debounce <sec> daemon: ignore a repeat connect this soon after a write
+                   (default 8). A disconnect clears it regardless.
   --log <path>     Mirror output to this file.
   -h, --help       Show this text.
 
@@ -536,7 +818,8 @@ EXIT CODES
   4 timeout        5 sent but could not verify the new state
 """
 
-let KNOWN_COMMANDS: Set<String> = ["apply", "revert", "read", "watch", "send", "scan", "sdp", "frame", "help"]
+let KNOWN_COMMANDS: Set<String> = ["apply", "daemon", "revert", "read", "watch",
+                                   "send", "scan", "sdp", "frame", "help"]
 
 func parseOptions(_ args: [String]) -> Options {
     var o = Options()
@@ -567,9 +850,11 @@ func parseOptions(_ args: [String]) -> Options {
         case "--listen":            o.listenSeconds = Double(value(&i, a))
         case "--attempts":          o.attempts = Int(value(&i, a)) ?? 8
         case "--retry":             o.retryDelay = Double(value(&i, a)) ?? 0.7
-        case "--no-wake":           o.wake = false
+        case "--no-wake":           o.wake = false; o.wakeExplicit = true
+        case "--wake":              o.wake = true;  o.wakeExplicit = true
         case "--wake-freq":         o.wakeFreq = Double(value(&i, a)) ?? 19_000
         case "--wake-vol":          o.wakeAmp = Float(value(&i, a)) ?? 0.02
+        case "--debounce":          o.debounce = Double(value(&i, a)) ?? 8
         case "--timeout":
             o.timeout = Double(value(&i, a)) ?? 60
             o.timeoutExplicit = true
@@ -642,6 +927,12 @@ final class SdpDumper: NSObject {
 
 /// Print what the buds report about their stored record, and verify the write.
 func reportState(_ rx: [UInt8], expecting asVer: UInt8?, wrote: Bool = true) -> Never {
+    let (code, msg) = describeState(rx, expecting: asVer, wrote: wrote)
+    finish(code, msg)
+}
+
+/// The body of `reportState`, minus the exit — the daemon has to keep running.
+func describeState(_ rx: [UInt8], expecting asVer: UInt8?, wrote: Bool) -> (Exit, String) {
     let state = decodeState(rx)
     log("")
     log("--- device state as reported by the buds --------------------------")
@@ -655,8 +946,8 @@ func reportState(_ rx: [UInt8], expecting asVer: UInt8?, wrote: Bool = true) -> 
             log("  the record. Re-run and start or stop playback while it listens.")
         }
         log("------------------------------------------------------------------")
-        if asVer != nil { finish(.notVerified, "no state frame to verify against") }
-        finish(wrote ? .ok : .notVerified, "no state frame")
+        if asVer != nil { return (.notVerified, "no state frame to verify against") }
+        return (wrote ? .ok : .notVerified, "no state frame")
     }
     if !wrote { log("  (nothing was written — this is the stored value)") }
     log("  state frames       : \(state.frameCount)")
@@ -678,11 +969,11 @@ func reportState(_ rx: [UInt8], expecting asVer: UInt8?, wrote: Bool = true) -> 
     }
     log("------------------------------------------------------------------")
 
-    guard let want = asVer else { finish(.ok, "") }
-    guard let got = state.asVer else { finish(.notVerified, "asVer not reported") }
+    guard let want = asVer else { return (.ok, "") }
+    guard let got = state.asVer else { return (.notVerified, "asVer not reported") }
     // The firmware normalises a written 0 up to 1, so only check the pass set.
-    if want == got || (want == 0 && got <= 1) { finish(.ok, "asVer=\(got)") }
-    finish(.notVerified, "wrote asVer=\(want) but the device reports \(got)")
+    if want == got || (want == 0 && got <= 1) { return (.ok, "asVer=\(got)") }
+    return (.notVerified, "wrote asVer=\(want) but the device reports \(got)")
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +993,9 @@ if let idx = rawArgs.firstIndex(of: "--log"), idx + 1 < rawArgs.count {
 }
 
 let opts = parseOptions(rawArgs)
+// For the daemon the log is a rolling record rather than the output of one
+// command, so every line — including this restart marker — needs a time on it.
+LOG.stamped = opts.command == "daemon"
 log("=== budsmp \(opts.command) ===")
 
 switch opts.command {
@@ -719,6 +1013,15 @@ case "frame":
 
 case "scan":
     runScan()
+
+case "daemon":
+    // Deliberately before findDevice: the daemon takes the device from the
+    // connect event, so it starts fine with the buds in the case — or not paired
+    // yet at all.
+    let daemon = Daemon(opts: opts, wake: opts.wakeExplicit ? opts.wake : false)
+    DispatchQueue.main.async { daemon.start() }
+    RunLoop.main.run()
+    finish(.timeout, "run loop ended")
 
 default:
     break

@@ -31,6 +31,10 @@ we expected — how it was measured and why the firmware leaves no way around it
 in [docs/experiments.md](docs/experiments.md#does-the-write-persist). If you'd
 rather undo it entirely, `./budsmp revert` puts everything back exactly as it was.
 
+On macOS you don't have to remember any of that: `macos/install-agent.sh` sets up
+a small background agent that writes the byte for you every time the buds connect.
+See [Keeping it applied](macos/README.md#keeping-it-applied).
+
 ## Where things stand
 
 | platform | state | how |
@@ -82,8 +86,10 @@ connected, and `asVer = 0` with the *correct* account dropped it. Method and
 results are in [docs/experiments.md](docs/experiments.md).
 
 If you want the full picture, [docs/protocol.md](docs/protocol.md) covers the
-wire format and [docs/firmware-gate.md](docs/firmware-gate.md) covers the
-firmware side.
+wire format, [docs/firmware-gate.md](docs/firmware-gate.md) covers the gate on
+the firmware side, and [docs/asver-lifetime.md](docs/asver-lifetime.md) follows
+that one byte around the firmware — everything that can write it, everything that
+erases it, and why no host can make it stick.
 
 ## Getting it running
 
@@ -110,6 +116,16 @@ hiding behind other windows.
 If `apply` can't open the channel, the buds are asleep. Take them out of the
 case, make them your audio output, play something, and try again.
 [macos/README.md](macos/README.md) walks through the other failure modes.
+
+Once it works, this makes it stick:
+
+```bash
+./install-agent.sh
+```
+
+A per-user LaunchAgent, no sudo, no login item — it watches for the buds
+connecting and writes the frame each time. `./install-agent.sh uninstall` removes
+it again.
 
 ### Linux
 

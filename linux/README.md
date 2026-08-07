@@ -87,7 +87,14 @@ multipoint arbitration — active stream wins — and not specific to this fix.
 The fix is not permanent, though. A disconnect and reconnect is fine, but once the
 buds power down in the case the `asVer` byte is back to `1` and the phone starts
 getting dropped again. Re-run `apply` when that happens — it takes a second and
-needs no re-pairing.
+needs no re-pairing. Why the firmware leaves no better option is
+[docs/asver-lifetime.md](../docs/asver-lifetime.md).
+
+There is no auto-apply on Linux yet. The macOS side ships a small agent that writes
+the frame on every connect event ([macos/README.md](../macos/README.md#keeping-it-applied));
+the equivalent here would be a systemd user unit triggered off a BlueZ
+`InterfacesAdded`/`Connected` signal, which nobody has written. If you do, a PR
+would be welcome. In the meantime a `udev` rule or a shell alias is usually enough.
 
 BlueZ will not switch profiles for you: if the buds come up as HSP/HFP rather
 than A2DP, pick `a2dp-sink` in your sound settings. Unrelated to this fix, but it

@@ -87,4 +87,11 @@ multipoint arbitration — active stream wins — and not specific to this fix.
 The fix is not permanent, though. A disconnect and reconnect is fine, but once the
 buds power down in the case the `asVer` byte is back to `1` and the phone starts
 getting dropped again. Re-run `apply` when that happens — it takes a second and
-needs no re-pairing.
+needs no re-pairing. Why the firmware leaves no better option is
+[docs/asver-lifetime.md](../docs/asver-lifetime.md).
+
+There is no auto-apply on Windows yet. The macOS side ships a small agent that
+writes the frame on every connect event
+([macos/README.md](../macos/README.md#keeping-it-applied)); the equivalent here
+would be a Task Scheduler task triggered off the Bluetooth device-connected event
+log, which nobody has written. Until then, run `apply` by hand.

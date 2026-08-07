@@ -80,10 +80,14 @@ cat > "${APP}/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature. TCC keys a grant to the code signature, so an unsigned
-# bundle would re-prompt after every rebuild.
+# Ad-hoc signature, so TCC has a stable identity to hang the Bluetooth grant on
+# across launches of this build. Stable across launches only: an ad-hoc signature
+# is derived from the bundle's contents, so any rebuild that changes the binary is
+# a new identity as far as TCC is concerned, and the prompt has to be answered
+# again. Dropping the marker is what makes the wrapper say so.
 codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 \
   || codesign --force --sign - "$APP"
+rm -f build/.tcc-granted
 
 echo "   built ${APP}"
 echo
