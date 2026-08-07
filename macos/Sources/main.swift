@@ -500,14 +500,15 @@ USAGE
 
 COMMANDS
   apply            Write asVer=2 so the buds stop tearing down the other device.
-                   This is the fix. It persists in the buds' NVRAM.
+                   This is the fix. It survives disconnects, but not the buds
+                   powering down — run it again after they have been in the case.
   revert           Write asVer=0, restoring the stock account-gated behaviour.
   read             Read back the stored device state (asVer, account hashes).
                    Writes --asver first (default 2) to make the buds report.
-  watch            Listen without writing anything, and report whatever the buds
-                   push. The only command that measures the stored value rather
-                   than one it just wrote — use it to test whether asVer survived
-                   a reconnect or a power cycle.
+  watch            Listen without writing anything and report whatever the buds
+                   push. On the firmware we tested they only report around a
+                   write, so this often sees nothing — `apply` is what reveals
+                   the stored value. See docs/experiments.md.
   send <hex>...    Send raw SMEP frames, then listen.
   scan             List paired Bluetooth devices and their RFCOMM services.
   sdp              Run a fresh SDP query on the target and dump the channel map.

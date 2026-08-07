@@ -123,8 +123,12 @@ ever GETs attributes `0x0001` and `0x0002`, and both are device-info dumps —
 model, serial, battery — with no account field.
 
 The stored state is only visible in a NOTIFY (`msgID 0x45`) whose payload starts
-`02 05 4c 0b`. The buds push it when a peer record is re-evaluated: on connect,
-on an audio state change, or right after an `MDE_VERSION` write.
+`02 05 4c 0b`. The buds push it when a peer record is re-evaluated, and the only
+trigger we could reproduce is an `MDE_VERSION` write. Opening the channel is not
+enough on its own: three listen-only runs of 45–90 s, with the audio route
+changing and a second host connecting during them, produced plenty of other
+`0x45` traffic and no state frame at all. That is a real limitation, not a
+formality — see [experiments.md](experiments.md#does-the-write-persist).
 
 ```
 02 05 4c 0b 00 80 02 01 AA BB 01 01 ...  eb 1a 00 CC DD ...
@@ -146,9 +150,44 @@ first sends a version-only `MDE_VERSION` carrying the value the device already
 holds. That write is a no-op for the record — critically, the short blob form does
 not touch the account field at all — but it makes the buds emit the state frame.
 
+### A write reports twice, and the first report is the old value
+
+A write does not produce one state frame; it produces a short burst of them, and
+they are a **before/after trace**. The earliest frames describe the record as it
+was, the last one describes it as it now is. On one run an `apply` that set
+`asVer = 2` reported, in order, `1 → 1 → 2 → 2`.
+
+That is worth knowing for two reasons. It is the only way a host can observe a
+value it did not itself just write — read the first frame, not the last, and you
+have the previous contents of the record. And it is a trap for a naive parser:
+taking the most common value across the burst reports `1` for a write that
+plainly succeeded, because a 2–2 split has no majority. `budsmp` reports the
+**last** decoded frame, and prints the whole sequence whenever the frames
+disagree.
+
 ## Persistence
 
-`asVer` and the account fields live in per-peer records in the buds' NVRAM. A
-single write survives disconnects, reconnects, and power cycles of both the buds
-and the host. It does not survive a factory reset of the buds, and it is scoped
-to one host address — pair a second computer and that one needs its own write.
+`asVer` and the account fields live in per-peer records in the buds' storage, and
+the write is scoped to one host address — pair a second computer and that one
+needs its own write.
+
+**It is not permanent.** Measured on Galaxy Buds2 Pro with a macOS host:
+
+| Event | `asVer` afterwards |
+| --- | --- |
+| right after `apply` | `2` — multipoint works |
+| disconnect, reconnect a minute later | `2` — still set |
+| both buds in the case, then taken out | `1` — back to blocked |
+
+A stored `1` is how a cleared field looks: writing `0` is normalised up to `1` by
+the firmware, so `1` means "nothing was ever set here". The symptom is unmistakable
+from the host side — the buds accept the RFCOMM connection and then drop it
+(`channel closed by peer`) the moment the phone connects, which is the stage-1
+gate doing its job.
+
+So `apply` is a per-power-cycle command, not a one-time patch. What exactly clears
+the record has not been isolated: the case power cycle is the suspect, but elapsed
+time and the buds' own idle shutdown were not ruled out separately. A factory reset
+clears it too, unsurprisingly. See
+[experiments.md](experiments.md#does-the-write-persist) for the runs behind this
+table.

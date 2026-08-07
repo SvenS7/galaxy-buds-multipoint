@@ -27,7 +27,7 @@ either form works. Its exit code is the tool's, so it composes fine in scripts.
 | `apply` | Write `asVer=2`, then read the state back to confirm it landed. |
 | `revert` | Write `asVer=0`, restoring stock behaviour. |
 | `read` | Report the stored `asVer` and account hashes. Writes `--asver` (default 2) first, because the buds only report when a record is re-evaluated. |
-| `watch` | Listen without writing anything and report what the buds push. The only command that shows the *stored* value rather than one it just wrote. |
+| `watch` | Listen without writing anything and report what the buds push. On the firmware we tested this usually sees nothing — see [experiments.md](../docs/experiments.md#does-the-write-persist). |
 | `send <hex>...` | Send raw SMEP frames and listen. |
 | `scan` | List paired devices. |
 | `sdp` | `sdptool browse` on the target; prints the RFCOMM channel map. |
@@ -72,12 +72,22 @@ BlueZ headers. Use the distribution's `python3` rather than a hand-built one.
 came back to confirm it. The buds only push one when they re-evaluate a record —
 start or stop playback and run `./budsmp read`.
 
+**It worked, and now it doesn't.** Expected after the buds have been in the case —
+they don't keep the value. Run `budsmp apply` again. The first number in `asVer as
+reported` is what was stored before the write; `1` means the record had been
+cleared. See [experiments.md](../docs/experiments.md#does-the-write-persist).
+
 ## Multipoint behaviour after the fix
 
 Both devices stay connected, and audio follows whoever is actively playing. If
 your phone is playing and you start a video on the PC, the PC does **not** grab
 the stream immediately; stop the phone and it switches over. That is ordinary
 multipoint arbitration — active stream wins — and not specific to this fix.
+
+The fix is not permanent, though. A disconnect and reconnect is fine, but once the
+buds power down in the case the `asVer` byte is back to `1` and the phone starts
+getting dropped again. Re-run `apply` when that happens — it takes a second and
+needs no re-pairing.
 
 BlueZ will not switch profiles for you: if the buds come up as HSP/HFP rather
 than A2DP, pick `a2dp-sink` in your sound settings. Unrelated to this fix, but it

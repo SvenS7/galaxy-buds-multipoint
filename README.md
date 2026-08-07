@@ -23,10 +23,13 @@ consulted.
 cd macos && ./budsmp apply
 ```
 
-That's the whole thing. One frame, `fc0b00014304030400000b021eafcc`, written a
-single time. It lives in the buds' own storage, so reconnects and reboots keep
-working, and if you'd rather undo it, `./budsmp revert` puts everything back
-exactly as it was.
+That's the whole thing — one frame, `fc0b00014304030400000b021eafcc`. It sticks
+across disconnects and reconnects, but not across the buds powering themselves
+down: once they've been sitting in the case, multipoint goes back to misbehaving
+and you run `apply` again. Annoying, and honestly not what we expected — the
+measurement is in [docs/experiments.md](docs/experiments.md#does-the-write-persist).
+If you'd rather undo it entirely, `./budsmp revert` puts everything back exactly
+as it was.
 
 ## Where things stand
 
@@ -158,7 +161,8 @@ keep for your computer. Which means:
   thing talking to your buds is your own computer, over Bluetooth.
 - **Only your host is touched.** The record for the computer you run it on, and
   nothing else — your phone's record is left alone.
-- **A factory reset clears it.** If you ever reset the buds, just run it again.
+- **Nothing here is permanent.** The buds clear the value on their own when they
+  power down, and a factory reset clears it too. Either way you just run it again.
 
 What it doesn't do is equally clear: it won't unlock features your buds don't
 have, it doesn't touch audio processing, and it changes nothing on your phone.
@@ -169,6 +173,10 @@ undoes.
 
 ## Limitations
 
+- **It doesn't stay applied.** Reconnecting is fine, but after the buds power down
+  in the case you'll need to run `apply` again. We haven't found a way around it
+  from the host side — the buds just don't hold on to the value. Details and the
+  measurement: [docs/experiments.md](docs/experiments.md#does-the-write-persist).
 - Only the host you run it on gets fixed, so a second computer needs its own run.
 - The buds hold two active links, and this doesn't raise that ceiling.
 - Audio follows whichever device is actively playing. Starting playback on the
