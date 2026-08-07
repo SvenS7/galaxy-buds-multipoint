@@ -167,9 +167,9 @@ disagree.
 
 ## Persistence
 
-`asVer` and the account fields live in per-peer records in the buds' storage, and
-the write is scoped to one host address — pair a second computer and that one
-needs its own write.
+`asVer` and the account fields live in per-peer records inside the buds, and the
+write is scoped to one host address — pair a second computer and that one needs its
+own write.
 
 **It is not permanent.** Measured on Galaxy Buds2 Pro with a macOS host:
 
@@ -179,15 +179,24 @@ needs its own write.
 | disconnect, reconnect a minute later | `2` — still set |
 | both buds in the case, then taken out | `1` — back to blocked |
 
-A stored `1` is how a cleared field looks: writing `0` is normalised up to `1` by
-the firmware, so `1` means "nothing was ever set here". The symptom is unmistakable
-from the host side — the buds accept the RFCOMM connection and then drop it
-(`channel closed by peer`) the moment the phone connects, which is the stage-1
-gate doing its job.
+A stored `1` is how a cleared field looks: a written `0` reads back as `1` too, so
+`1` means "nothing was ever set here". The symptom is unmistakable from the host
+side — the buds accept the RFCOMM connection and then drop it
+(`channel closed by peer`) the moment the phone connects, which is the stage-1 gate
+doing its job.
 
-So `apply` is a per-power-cycle command, not a one-time patch. What exactly clears
-the record has not been isolated: the case power cycle is the suspect, but elapsed
-time and the buds' own idle shutdown were not ruled out separately. A factory reset
-clears it too, unsurprisingly. See
-[experiments.md](experiments.md#does-the-write-persist) for the runs behind this
-table.
+The firmware explains the split exactly. The peer records are an array in on-die
+RAM, not in flash; boot `memset`s each one and writes no default into `+0x4f`, and
+the routine that repopulates a record when a peer connects restores the account
+fields from non-volatile storage but reads `asVer` from the live record and writes
+the same byte straight back. So the value is kept alive only by the RAM holding it:
+an ordinary disconnect leaves it untouched, a power cycle takes it with everything
+else, and there is nothing a host can send to make it stick.
+[firmware-gate.md](firmware-gate.md#where-the-record-lives-and-why-the-fix-evaporates)
+has the addresses.
+
+So `apply` is a per-power-session command, not a one-time patch: run it whenever the
+buds have powered on. Two other things clear the byte through the same reset —
+giving a device a record for the first time, and fully releasing one — so removing
+and re-adding your computer costs a write as well. See
+[experiments.md](experiments.md#does-the-write-persist) for the measurement.

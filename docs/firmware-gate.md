@@ -29,9 +29,20 @@ When audio comes up on a second device the firmware runs a check in
 `asVer` is written by exactly one thing: the `MDE_VERSION` handler. Nothing else
 in the firmware sets that field.
 
-A Galaxy phone sends `MDE_VERSION` during pairing, so it gets `asVer = 2`.
-Third-party clients connect to `GEARMANAGER` (ch 27) and never touch
-`SPPSERVICE4` (ch 29), so they never send it, so their `asVer` stays **0**.
+A Galaxy phone sends `MDE_VERSION`, so it gets `asVer = 2`. Third-party clients
+connect to `GEARMANAGER` (ch 27) and never touch `SPPSERVICE4` (ch 29), so they
+never send it, and their `asVer` stays **0**.
+
+When the phone sends it is less clear than it looks. The frame turns up in a capture
+at re-pairing, and the code that builds it is in none of the Android trees we could
+read — `SPPSERVICE4` belongs to the platform Bluetooth stack, and the connection path
+there sends other things but not this. Pairing-time registration would be the natural
+reading. It cannot be the whole story, though: the record is wiped every time the
+buds boot (see below), and phone-to-buds multipoint keeps working after a spell in
+the case, so **something on the phone must re-send it at least once per buds
+power-on.** That is an inference from behaviour rather than code we have read — but
+it is also the reason `budsmp apply` is a per-power-session command rather than a
+one-off. The host is doing what the phone does; it just has to be told to.
 
 That is the whole bug. A non-Galaxy host fails at stage 1 with `0xa9` and never
 reaches the account check at all. The behaviour looks account-related because
@@ -64,6 +75,70 @@ the comparison it performs is a 6-byte memcmp of Bluetooth addresses — it asks
 bookkeeping identifies peers. It does not inspect the Class of Device and it does
 not reject anything. It is not the lever.
 
+## Where the record lives, and why the fix evaporates
+
+The fix does not survive the buds powering down — measured on hardware, and the
+firmware says exactly why.
+
+The peer records are not in flash. They are an array in on-die RAM at
+`0x2057AE38`, `0x127` bytes per peer, five slots; `GetInternal@0x17672c` returns
+`base + 0x127*id + 0xB` and `asVer` is `+0x4f` inside that.
+
+At boot, `TwuConn_Init@0x179824` loops over ids 0–4 and calls the record
+initialiser at `0x175e8c` with `arg = 3`, the full-reset variant:
+`memset(record, 0, 0x127)`. It then restores a handful of fields by hand —
+`+0xd`, `+0x19`, `+0x21`, `+0x2d`, `+0x2e` — and `+0x4f` is not one of them. So
+every power-on leaves `asVer = 0` on every slot, and nothing loads it back from
+flash.
+
+The connection-time restore path looks like it ought to help. It does not.
+`TwfConnDeviceSetting_UpdateConnectedRecord@0x228180` genuinely does repopulate a
+record when a peer connects, but for `asVer` it reads the *live* byte and writes
+the same byte back:
+
+```
+228386  ldrb.w r3, [r3, #0x4f]    ; from the live runtime record
+22838A  strb.w r3, [r7, #0x14a]   ; the only writer of this local, function-wide
+  ...
+2285B2  ldrb.w r2, [r7, #0x14a]
+2285BA  strb.w r2, [r3, #0x4f]    ; same value, same record — a no-op
+```
+
+The bytes that *do* come out of non-volatile storage land in neighbouring locals
+(`+0x14b`, `+0x1ed`) and feed the account fields. That asymmetry is the whole
+story: **your account hash is restored on connect, `asVer` never is.**
+
+The `MDE_VERSION` handler does call `TwfConnDeviceSetting_SetRecord@0x228F98`,
+which packs `asVer` into a RAM shadow copy and sets a dirty flag — but the actual
+norflash flush (`TwaSetting_Flush@0x263ee0`) is only reached from factory, AT
+command and boot-load contexts, never from a setting write. And per the paragraph
+above, flushing it would not matter anyway, because nothing reads it back.
+
+So **a host cannot make this durable.** Pinning `asVer` across a power cycle needs
+a firmware change: a default of `2` in the record initialiser, a restore path that
+actually loads the stored byte, or a handler that refuses to downgrade. From the
+host side the only option is to write it again, which is what `budsmp apply` is.
+
+Three paths clear the byte, and all three are the same full `memset`:
+
+| path | when it runs |
+|---|---|
+| `TwuConn_Init@0x179824` | boot — i.e. every time the buds power on |
+| `TwuConnDevice_UpdateConnection` `@0x1768c6` | a device is given a slot for the first time |
+| same function `@0x176d1a` | a slot is fully released (`record[0x24] == 0 && record[0x2c] == 0`) |
+
+The partial re-inits used on an ordinary disconnect (`arg = 1` at `0x176bd6`,
+`arg = 2` at `0x176c80`) leave `+0x4f` alone. That is precisely why the fix
+survives disconnecting and reconnecting but not a spell in the case. The link-key
+"key missing" clear at `0x229B34` writes a different table altogether and does not
+touch `asVer` either.
+
+Addresses are file offsets into `seg6.bin` of firmware `R510XXU0AZD1`; other
+builds will differ. The three claims this section rests on — the boot `memset`,
+`+0x4f` getting no default, and the restore being a no-op — were each read off the
+disassembly directly. The hardware measurement is in
+[experiments.md](experiments.md#does-the-write-persist).
+
 ## Field reference
 
 | field | offset | meaning |
@@ -80,3 +155,9 @@ not reject anything. It is not the lever.
 
 Writing `asVer = 0` normalises to `1` in the stored state — either way it is
 outside the pass set, which is what makes `budsmp revert` a clean undo.
+
+That same off-by-one is why a freshly booted record reads back as `1` and not the
+`0` the `memset` leaves behind: something on the write or report path bumps `0` up
+to `1`, and which instruction does it is not pinned down. It makes no difference to
+the gate — `0` and `1` both fail it — but it is worth knowing when you read a
+value back, because `1` is what a cleared record looks like from a host.

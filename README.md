@@ -25,11 +25,11 @@ cd macos && ./budsmp apply
 
 That's the whole thing — one frame, `fc0b00014304030400000b021eafcc`. It sticks
 across disconnects and reconnects, but not across the buds powering themselves
-down: once they've been sitting in the case, multipoint goes back to misbehaving
-and you run `apply` again. Annoying, and honestly not what we expected — the
-measurement is in [docs/experiments.md](docs/experiments.md#does-the-write-persist).
-If you'd rather undo it entirely, `./budsmp revert` puts everything back exactly
-as it was.
+down: the byte lives in RAM they wipe at boot, so once they've been sitting in the
+case, multipoint misbehaves again and you run `apply` again. Annoying, and not what
+we expected — how it was measured and why the firmware leaves no way around it are
+in [docs/experiments.md](docs/experiments.md#does-the-write-persist). If you'd
+rather undo it entirely, `./budsmp revert` puts everything back exactly as it was.
 
 ## Where things stand
 
@@ -174,9 +174,12 @@ undoes.
 ## Limitations
 
 - **It doesn't stay applied.** Reconnecting is fine, but after the buds power down
-  in the case you'll need to run `apply` again. We haven't found a way around it
-  from the host side — the buds just don't hold on to the value. Details and the
-  measurement: [docs/experiments.md](docs/experiments.md#does-the-write-persist).
+  in the case you'll need to run `apply` again. There's no host-side way around
+  that: the records live in RAM the buds clear at boot, and the routine that
+  restores a record when you reconnect deliberately leaves this one byte alone —
+  it restores your account hash but writes `asVer` back over itself. Only a
+  firmware change could pin it. Measurement and addresses:
+  [docs/experiments.md](docs/experiments.md#does-the-write-persist).
 - Only the host you run it on gets fixed, so a second computer needs its own run.
 - The buds hold two active links, and this doesn't raise that ceiling.
 - Audio follows whichever device is actively playing. Starting playback on the

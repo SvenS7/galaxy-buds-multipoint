@@ -99,11 +99,14 @@ being measured.
 
 ## Does the write persist?
 
-Not across a power cycle of the buds. Earlier versions of this repo said it was
-permanent; that was an assumption carried over from "the field lives in
-non-volatile storage", and nobody had gone back to look at the value later. When
-multipoint stopped working after the buds had been in their case, the assumption
-got measured, and it was wrong.
+Not across a power cycle of the buds.
+
+It is an easy thing to get wrong, and this repo got it wrong first: `asVer` sits in
+a per-device record next to your account hash, which reads like stored
+configuration, and a write to it plainly kept working across reconnects. That is
+enough to *feel* settled without anyone having gone back to look at the value later.
+Then multipoint broke after the buds spent a while in their case, and the assumption
+finally got measured.
 
 ### Why this is awkward to measure
 
@@ -150,27 +153,29 @@ One device, in order:
    stored value had been `1`.** The write fixed it on the spot; multipoint worked
    again, with no re-pairing.
 
-Step 4 is the result. A stored `1` is precisely how a *cleared* field reads back,
-because the firmware normalises a written `0` up to `1` — the same normalisation
-already observed in the account experiment above. And `1` is outside `{2, 3}`, so
-stage 1 of the gate tears the link down, which is exactly the `channel closed by
-peer` seen in step 3.
+Step 4 is the result. A `1` is precisely how a *cleared* field reads back — the same
+off-by-one as in the account experiment above, where a deliberately written `0` also
+came back as `1`. And `1` is outside `{2, 3}`, so stage 1 of the gate tears the link
+down, which is exactly the `channel closed by peer` of step 3.
 
-### What this establishes, and what it does not
+### Why it behaves that way
 
-Established: the write is **not permanent**, it survives a disconnect/reconnect,
-and re-running `apply` is enough to restore it. That is now what the README and
-[protocol.md](protocol.md#persistence) say.
+The measurement above left one thing open — the buds had been power-cycled *and*
+several minutes had passed, so the trial alone could not say which mattered. The
+firmware settles it: the peer records live in on-die RAM rather than flash, boot
+clears them and writes no default into the `asVer` byte, and the routine that
+repopulates a record on connect restores the account fields from non-volatile
+storage while writing `asVer` back over itself. Nothing persists the byte, and
+nothing would load it if it were persisted.
 
-Not established: **which event clears it.** Between step 2 and step 3 the buds were
-power-cycled by the case, several minutes passed, and the link went down — and only
-the power cycle is unique to step 3, since step 2 also involved a disconnect and a
-reconnect. That makes the case cycle the likely cause, but it is inference from a
-single trial, not a measurement.
+That predicts precisely the split that was measured — survives a reconnect, dies
+with the power — and it also means there is no host-side trick worth looking for.
+The addresses are in
+[firmware-gate.md](firmware-gate.md#where-the-record-lives-and-why-the-fix-evaporates).
 
-If you would like to narrow it down, the missing run is: `apply`, then leave the
-buds out of the case and idle long enough to shut themselves down, then `apply`
-again and read the first reported value.
+### Checking it on your own buds
+
+Two writes and a trip to the case:
 
 ```bash
 ./budsmp apply          # note "asVer=2"
