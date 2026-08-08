@@ -663,19 +663,21 @@ final class Daemon: NSObject {
             schedule(dev, after: 3.0)
             return
         }
-        guard dev.isConnected() else {
-            // Registering for connect notifications also delivers one for devices
-            // that were already connected, and a real event can land a beat
-            // before the link is up, so give it a moment before deciding.
-            guard connectWait > 0 else {
-                log("daemon: \(label(dev)) is not connected after all; nothing to write")
+        if !dev.isConnected() {
+            // A real event can land a beat before the link is up, so give it a
+            // moment. But do not treat isConnected() as authoritative: on the
+            // buds this was developed against it reports false throughout a
+            // perfectly usable session — `apply` prints connected=false and then
+            // opens the channel and writes. The RFCOMM open is the only honest
+            // test of whether the device is there, so fall through to it.
+            if connectWait > 0 {
+                pending.insert(k)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    self.apply(dev, key: k, connectWait: connectWait - 1)
+                }
                 return
             }
-            pending.insert(k)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                self.apply(dev, key: k, connectWait: connectWait - 1)
-            }
-            return
+            log("daemon: \(label(dev)) still reports disconnected; trying anyway")
         }
 
         running = true

@@ -108,19 +108,37 @@ because for a process that runs for days the useful question is *when*. A normal
 session looks like:
 
 ```
-08-08 05:31:07  === budsmp daemon ===
-08-08 05:31:07  daemon: writing asVer=2 whenever a paired device whose name contains "buds" connects
-08-08 05:31:07  daemon: wake tone off, debounce 8.0s
-08-08 05:31:07  daemon: ready
-08-08 09:14:22  daemon: connected — "Galaxy Buds2 Pro" xx-xx-xx-xx-xx-xx
-08-08 09:14:26    asVer (this host)  : 2   [multipoint allowed]
-08-08 09:14:26    asVer as reported  : 1 -> 2
-08-08 09:14:26  daemon: written and verified — asVer=2
+08-09 00:08:25  === budsmp daemon ===
+08-09 00:08:25  daemon: writing asVer=2 whenever a paired device whose name contains "buds" connects
+08-09 00:08:25  daemon: wake tone off, debounce 8.0s
+08-09 00:08:26  daemon: connected — "Galaxy Buds2 Pro" xx-xx-xx-xx-xx-xx
+08-09 00:08:26  daemon: ready
+08-09 00:08:35  daemon: "Galaxy Buds2 Pro" xx-xx-xx-xx-xx-xx still reports disconnected; trying anyway
+08-09 00:08:35  resolved SPPSERVICE4 -> RFCOMM channel 29 from SDP
+08-09 00:08:35  open ch29 attempt 1/15 => 0xe00002bc
+08-09 00:08:36  open ch29 attempt 2/15 => 0x00000000
+08-09 00:08:36  channel 29 OPEN, MTU=669
+08-09 00:08:36  TX[0] 15B fc0b00014304030400000b021eafcc => 0x00000000
+08-09 00:08:41    asVer (this host)  : 2   [multipoint allowed]
+08-09 00:08:41  daemon: written and verified — asVer=2
 ```
 
-The `1 -> 2` is the useful part: the first value is what the record held before the
-write, so `1` there is the record having been cleared by a power cycle, exactly as
-expected.
+(Trimmed: the real thing also logs the raw RX frames and the account fields, the
+same as `apply`.)
+
+Two lines there are worth knowing about rather than worrying about. **`still
+reports disconnected; trying anyway`** is routine: `IOBluetoothDevice.isConnected()`
+returns false on the buds this was developed against even mid-session, while the
+channel opens and the write lands, so the daemon treats the RFCOMM open as the real
+test. And the **first `open` attempt failing** is the buds' SPP server still coming
+up, which is what the retry loop is for.
+
+Sometimes there is also an `asVer as reported : 1 -> 2` line. That is a trace of
+the record before and after the write, so a leading `1` means the record had been
+cleared while the buds were in the case — expected, and the reason the daemon
+exists. It only appears when the buds emit more than one state frame and those
+frames disagree, which they do not always do: a run straight after a case cycle
+can report a single frame and no trace at all.
 
 A few deliberate choices, in case the behaviour surprises you:
 
