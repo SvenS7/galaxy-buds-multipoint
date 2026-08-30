@@ -2,6 +2,10 @@
 
 Galaxy Buds multipoint on your computer — no Samsung account needed.
 
+> **Tested on Galaxy Buds3 Pro**
+
+> **This fork adds — Windows Tray App by SvenS7** on top of the original by **id6917824**: tray-first `tray/app.py` (`uv run app.py` → system tray, no CLI), robust auto-fix on every connect/boot/case power-cycle (polling + hysteresis + RFCOMM lock, `tray/buds_fix.py`), reliable autorun at **boot + login** (Task Scheduler XML `LogonTrigger+BootTrigger` + fallbacks, `tray/startup.py`), full uninstall, `uv` project and English UI. Original `python/budsmp/*` vendored unchanged. Based on <https://github.com/id6917824/galaxy-buds-multipoint> (MIT). See [What's new in this fork](#whats-new-in-this-fork-windows-tray-app-by-svens7) and [tray/README.md](tray/README.md).
+
 *[한국어](README.ko.md)*
 
 You probably know the moment. Your Galaxy Buds2 Pro are connected to your phone

@@ -1,5 +1,7 @@
 # Galaxy Buds Multipoint Fix — Windows Tray App
 
+> **Tested on Galaxy Buds3 Pro**
+
 Compact Windows Python app that automatically applies `budsmp apply` (`asVer=2` via `SPPSERVICE4` RFCOMM) whenever your paired Galaxy Buds connect. **Fully tray-driven — no CLI needed.**
 
 - Double-click `app.py` / `uv run app.py` / later `BudsFix.exe` → blue **B** icon in the system tray
@@ -22,8 +24,8 @@ This `tray/` app is a **Windows-only extension** built on the original `galaxy-b
   - Periodic re-verify every 90s while connected; if `asVer` fell back to `1` after a case/power-cycle, it re-applies automatically without user action. Debounce is bypassed for `startup` and `asVer=1 → re-apply`.
   - Global `_rfcomm_lock` serializes all RFCOMM access (monitor + UI) to prevent `WSAEADDRINUSE (10048)` collisions.
   - Fully local, no network, reuses original `frame.version_only(2)` → `fc0b00014304030400000b021eafcc`.
-- **Reliable autorun** (`tray/startup.py`) — prefers Task Scheduler with **both** `LogonTrigger` **and** `BootTrigger` in one XML task (`GalaxyBudsMultipointFix`), so the app runs after boot *and* after login. Fallback chain if Scheduler is blocked: separate `onlogon` + `onstart` (`GalaxyBudsMultipointFixBoot`) tasks → Startup folder `.bat` → `HKCU\...\Run` registry. `Disable Autorun` / `Uninstall` cleanly removes all variants. Verified on Buds3 Pro (`2C:DA:46:9D:33:94`).
-- **Clean uninstall** — `tray/startup.py:uninstall_all()` removes *all* Scheduler tasks (logon + boot), Startup `.bat`/`.lnk`, registry key, `%LOCALAPPDATA%\GalaxyBudsMultipoint\logs`, `tray/logs/*.log`, `%TEMP%\budsmp-wake-*.wav`, lock file and AppData config, then shows a dialog of what was removed. `Close` only stops the tray (autorun stays).
+- **Reliable autorun** (`tray/startup.py`) — prefers Task Scheduler with **both** `LogonTrigger` **and** `BootTrigger` in one XML task (`GalaxyBudsMultipointFix`), so the app runs after boot _and_ after login. Fallback chain if Scheduler is blocked: separate `onlogon` + `onstart` (`GalaxyBudsMultipointFixBoot`) tasks → Startup folder `.bat` → `HKCU\...\Run` registry. `Disable Autorun` / `Uninstall` cleanly removes all variants. Verified on Buds3 Pro (`2C:DA:46:9D:33:94`).
+- **Clean uninstall** — `tray/startup.py:uninstall_all()` removes _all_ Scheduler tasks (logon + boot), Startup `.bat`/`.lnk`, registry key, `%LOCALAPPDATA%\GalaxyBudsMultipoint\logs`, `tray/logs/*.log`, `%TEMP%\budsmp-wake-*.wav`, lock file and AppData config, then shows a dialog of what was removed. `Close` only stops the tray (autorun stays).
 - **Project tooling** — `tray/pyproject.toml` (`pystray` + `Pillow`, `requires-python >=3.9`), `uv` managed (`uv sync` / `uv run app.py` / `uv.lock`), `tray/config.json` with `poll_interval`, `debounce_seconds`, `verify_interval`, `disconnected_retry_seconds`, etc.
 - **Quiet operation** — console is hidden when `--minimized` (Task/exe), status window auto-refresh is light (15s, only `Autorun: on/off`), heavy RFCOMM `check_status` only on explicit user action; logs go to rotating files in AppData and `tray/logs/`.
 
@@ -46,16 +48,16 @@ BudsFix.exe                   # same — tray appears
 
 Right-click the blue **B** icon:
 
-| Menu item | What it does |
-|---|---|
-| **Open** | Show status window (paired / connected / fix / autorun) |
+| Menu item             | What it does                                                 |
+| --------------------- | ------------------------------------------------------------ |
+| **Open**              | Show status window (paired / connected / fix / autorun)      |
 | **Check Buds status** | Read `asVer` from Buds via RFCOMM and show multipoint status |
-| **Run fix now** | Apply fix immediately (`asVer=2`) |
-| **Revert fix** | Restore stock behavior (`asVer=0` → `1`) |
-| **Enable Autorun** | Create Task Scheduler task(s) for boot + login |
-| **Disable Autorun** | Remove task / Startup item / Registry key |
-| **Uninstall (full)** | Remove autorun + logs + temp files, show what was removed |
-| **Close** | Quit tray + monitor (autorun stays) |
+| **Run fix now**       | Apply fix immediately (`asVer=2`)                            |
+| **Revert fix**        | Restore stock behavior (`asVer=0` → `1`)                     |
+| **Enable Autorun**    | Create Task Scheduler task(s) for boot + login               |
+| **Disable Autorun**   | Remove task / Startup item / Registry key                    |
+| **Uninstall (full)**  | Remove autorun + logs + temp files, show what was removed    |
+| **Close**             | Quit tray + monitor (autorun stays)                          |
 
 Menu items `Enable`/`Disable` are automatically enabled/disabled based on current autorun state. The status window (Open) has the same actions as buttons.
 
@@ -71,6 +73,7 @@ GalaxyBudsMultipointFix  LogonTrigger + BootTrigger  /RL limited  InteractiveTok
 ```
 
 Check manually:
+
 ```powershell
 schtasks /query /tn GalaxyBudsMultipointFix /v
 schtasks /query /tn GalaxyBudsMultipointFixBoot /v   # fallback boot task
