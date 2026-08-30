@@ -93,6 +93,8 @@ def load_config() -> dict:
     cfg.setdefault("as_ver", 2)
     cfg.setdefault("poll_interval", 3.0)
     cfg.setdefault("debounce_seconds", 20.0)
+    cfg.setdefault("verify_interval", 90.0)
+    cfg.setdefault("disconnected_retry_seconds", 25.0)
     cfg.setdefault("auto_apply", True)
     cfg.setdefault("listen_seconds", 6.0)
     cfg.setdefault("attempts", 8)
@@ -142,7 +144,31 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # single-instance guard — voorkom dubbele tray bij dubbelklik/autorun race
+    lock_path = Path(os.environ.get("TEMP", str(Path.home()))) / "GalaxyBudsMultipointFix.lock"
+    try:
+        # Use exclusive create; if exists, check if owning pid still alive
+        if lock_path.exists():
+            try:
+                pid = int(lock_path.read_text(encoding="utf-8").strip())
+                # check if process still running (Windows: use OpenProcess via psutil fallback)
+                import subprocess as _sp
+                rc = _sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5)
+                if str(pid) in rc.stdout:
+                    print(f"App draait al (PID {pid}) — focus tray in plaats van tweede instantie.", file=sys.stderr)
+                    sys.exit(0)
+            except Exception:
+                pass
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
+
     setup_logging(verbose=args.verbose)
+    # Bij --minimized: console stilhouden (alleen file logs), tray blijft leidend
+    if args.minimized:
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(logging.WARNING)
     log = logging.getLogger("app")
 
     # Config overrides via CLI

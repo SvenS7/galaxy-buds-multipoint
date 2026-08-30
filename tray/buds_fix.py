@@ -150,11 +150,43 @@ def check_status(name_needle: str = "buds", address: str | None = None,
 
 
 # ---------------------------------------------------------------------------
+# Helpers voor robuuste detectie
+# ---------------------------------------------------------------------------
+
+def _can_open_rfcomm(address: str, channel: int | None, attempts: int = 3,
+                     retry_delay: float = 0.5, timeout: float = 4.0) -> bool:
+    """Snelle probe: is RFCOMM SPP4 bereikbaar ook als PnP 'disconnected' zegt?
+
+    De PnP-status is slechts een proxy (OK/Unknown) en blijft soms 'Unknown'
+    terwijl de Buds al wakker zijn. Een korte open is de ground truth.
+    """
+    ch = resolve_channel(address, channel)
+    try:
+        transport.bluetooth_family()
+    except transport.Unsupported:
+        return False
+    sess = transport.Session(address, ch, _null_log,
+                             attempts=attempts, retry_delay=retry_delay,
+                             connect_timeout=timeout)
+    try:
+        sess.open()
+        return True
+    except Exception:
+        return False
+    finally:
+        sess.close()
+
+
+# ---------------------------------------------------------------------------
 # Background monitor — pollt pairing/connection en auto-applied fix
 # ---------------------------------------------------------------------------
 
 class BudsMonitor(threading.Thread):
-    """Pollt elke poll_interval; bij nieuwe connectie -> apply_fix."""
+    """Pollt elke poll_interval; bij nieuwe connectie -> apply_fix.
+
+    Robuust tegen PnP mismatch (extra RFCOMM retry) en power/case-cycle
+    (asVer terug op 1) via periodieke re-verify en startup-check.
+    """
 
     def __init__(self, config: dict,
                  on_event: Callable[[str], None] | None = None,
@@ -166,10 +198,41 @@ class BudsMonitor(threading.Thread):
         self._stop = threading.Event()
         self._last_connected: dict[str, bool] = {}
         self._last_fix_ts: float = 0.0
+        self._last_verify_ts: float = 0.0
+        self._last_disconnected_probe: dict[str, float] = {}
         self._last_status: BudsStatus | None = None
+        self._startup_done = False
 
     def stop(self):
         self._stop.set()
+
+    def _maybe_fix(self, addr: str, name: str, channel: int | None,
+                   as_ver: int, attempts: int, retry_delay: float,
+                   listen_seconds: float, reason: str) -> None:
+        now = time.monotonic()
+        debounce = float(self.config.get("debounce_seconds", 20.0))
+        # Re-apply na case/power-cycle (asVer terug op 1) moet debounce bypassen,
+        # anders blijft multipoint geblokkeerd tot debounce verloopt
+        bypass = reason in ("startup",) or reason.startswith("asVer=")
+        if now - self._last_fix_ts < debounce and not bypass:
+            log.info("fix skip %s debounce %.0fs rest (%s)", addr,
+                     debounce - (now - self._last_fix_ts), reason)
+            return
+        log.info("auto fix trigger %s \"%s\" reason=%s asVer=%d", addr, name, reason, as_ver)
+        if self.on_event:
+            self.on_event(f"Buds {name} — fix wordt toegepast ({reason})…")
+        # SPP server komt ~0.5-1s na ACL up
+        time.sleep(0.8)
+        ok, msg = apply_fix(addr, channel, as_ver=as_ver,
+                            attempts=max(attempts, 10),
+                            retry_delay=retry_delay,
+                            listen_seconds=listen_seconds)
+        self._last_fix_ts = time.monotonic()
+        self._last_verify_ts = self._last_fix_ts
+        level = logging.INFO if ok else logging.WARNING
+        log.log(level, "auto fix %s (%s): %s", addr, reason, msg)
+        if self.on_event:
+            self.on_event(f"Fix {'ok' if ok else 'mislukt'}: {msg}")
 
     def run(self):
         name_needle = self.config.get("name_needle", "buds")
@@ -182,13 +245,44 @@ class BudsMonitor(threading.Thread):
         attempts = int(self.config.get("attempts", 8))
         retry_delay = float(self.config.get("retry_delay", 0.7))
         listen_seconds = float(self.config.get("listen_seconds", 6.0))
+        verify_interval = float(self.config.get("verify_interval", 90.0))
+        disconnected_retry = float(self.config.get("disconnected_retry_seconds", 25.0))
 
-        log.info("monitor start: needle=%r poll=%.1fs debounce=%.1fs auto_apply=%s",
-                 name_needle, poll, debounce, auto_apply)
+        log.info("monitor start: needle=%r poll=%.1fs debounce=%.1fs verify=%.0fs auto_apply=%s",
+                 name_needle, poll, debounce, verify_interval, auto_apply)
+
+        # Direct bij opstart: status-check en indien gekoppeld meteen fix proberen
+        # (dekt cold-boot, login terwijl Buds al verbonden zijn, en case-cycle tijdens uit).
+        if auto_apply:
+            try:
+                if address:
+                    dev0 = find_buds(name_needle, address)
+                    cands0 = [dev0] if dev0 else []
+                else:
+                    cands0 = paired_buds(name_needle)
+                for dev in cands0:
+                    # Probeer ook als PnP "disconnected" zegt — RFCOMM is leading
+                    reachable = dev.connected or _can_open_rfcomm(dev.address, channel)
+                    if reachable:
+                        # Snelle asVer-check: schrijf probe en lees terug
+                        _, _, reported = _do_rfcomm_write(
+                            dev.address, resolve_channel(dev.address, channel),
+                            as_ver, attempts=max(attempts, 6),
+                            retry_delay=retry_delay, listen_seconds=listen_seconds)
+                        # Als geen state of asVer != gewenst, dan fix
+                        if reported is None or reported != as_ver:
+                            log.info("startup-check %s \"%s\" asVer=%s -> fix", dev.address, dev.name, reported)
+                            self._maybe_fix(dev.address, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason="startup")
+                        else:
+                            log.info("startup-check %s asVer=%s ok — geen fix nodig", dev.address, reported)
+                            self._last_fix_ts = time.monotonic()
+                            self._last_verify_ts = time.monotonic()
+                self._startup_done = True
+            except Exception as exc:
+                log.debug("startup check faalde (niet fataal): %s", exc)
 
         while not self._stop.is_set():
             try:
-                # Vind candidates
                 if address:
                     dev = find_buds(name_needle, address)
                     candidates = [dev] if dev else []
@@ -196,67 +290,78 @@ class BudsMonitor(threading.Thread):
                     candidates = paired_buds(name_needle)
 
                 if not candidates:
-                    # Rustige status wanneer niet gekoppeld
                     if self._last_status is None or self._last_status.paired:
                         st = BudsStatus(False, False, None, None, None, None, None)
                         self._last_status = st
                         if self.on_status:
                             self.on_status(st)
                     self._last_connected.clear()
+                    self._last_disconnected_probe.clear()
                     self._stop.wait(poll)
                     continue
 
+                now = time.monotonic()
                 for dev in candidates:
                     addr = dev.address
                     was = self._last_connected.get(addr)
-                    is_now = bool(dev.connected)
-                    # Update status callback (eerste device)
+                    pnp_connected = bool(dev.connected)
+                    # Ground truth: als PnP nee zegt maar RFCOMM wel open kan, toch connected
+                    is_now = pnp_connected
+                    probed = False
+                    if not pnp_connected and auto_apply:
+                        last_probe = self._last_disconnected_probe.get(addr, 0)
+                        if now - last_probe >= disconnected_retry:
+                            self._last_disconnected_probe[addr] = now
+                            if _can_open_rfcomm(addr, channel, attempts=3, retry_delay=0.4, timeout=3.0):
+                                log.info("PnP zegt disconnected maar RFCOMM open lukt %s \"%s\" — behandel als connected", addr, dev.name)
+                                is_now = True
+                                probed = True
+                                if self.on_event:
+                                    self.on_event(f"Buds {dev.name}: PnP mismatch — toch verbonden, fix check…")
+
                     if dev == candidates[0]:
                         st = BudsStatus(True, is_now, dev.address, dev.name, None, None, None)
                         self._last_status = st
                         if self.on_status:
                             self.on_status(st)
 
-                    # Detecteer disconnect -> reset debounce zodat case-trip opnieuw triggert
-                    if was is True and is_now is False:
+                    if was is True and is_now is False and not probed:
                         log.info("disconnect gedetecteerd %s \"%s\"", addr, dev.name)
-                        # laat debounce verlopen: volgende connect mag meteen
-                        # maar voorkom meteen dubbele trigger door last_fix_ts te behouden
-                        # we wissen alleen was-state
                         self._last_connected[addr] = False
+                        # reset verify zodat volgende connect snel re-verifieert
+                        self._last_verify_ts = 0
                         if self.on_event:
                             self.on_event(f"Buds disconnected: {dev.name}")
                         continue
 
-                    if was is False and is_now is True or (was is None and is_now is True):
-                        # Nieuwe connectie
-                        now = time.monotonic()
-                        if now - self._last_fix_ts < debounce:
-                            log.info("connect %s maar debounce %.0fs rest — skip",
-                                     addr, debounce - (now - self._last_fix_ts))
-                            self._last_connected[addr] = True
-                            continue
-                        log.info("connect gedetecteerd %s \"%s\" -> auto fix asVer=%d",
-                                 addr, dev.name, as_ver)
-                        if self.on_event:
-                            self.on_event(f"Buds connected: {dev.name} — fix wordt toegepast…")
-                        if auto_apply:
-                            # Extra kleine delay: SPP server komt ~0.5-1s na ACL up
-                            time.sleep(0.8)
-                            ok, msg = apply_fix(addr, channel, as_ver=as_ver,
-                                                attempts=max(attempts, 10),
-                                                retry_delay=retry_delay,
-                                                listen_seconds=listen_seconds)
-                            self._last_fix_ts = time.monotonic()
-                            level = logging.INFO if ok else logging.WARNING
-                            log.log(level, "auto fix %s: %s", addr, msg)
-                            if self.on_event:
-                                self.on_event(f"Fix {'ok' if ok else 'mislukt'}: {msg}")
-                        else:
-                            log.info("auto_apply uit — skip")
+                    if (was is False and is_now is True) or (was is None and is_now is True):
+                        self._maybe_fix(addr, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason="connect")
                         self._last_connected[addr] = True
-                    else:
-                        self._last_connected[addr] = is_now
+                        continue
+
+                    # Al verbonden — periodieke re-verify voor case/power-cycle
+                    # Als asVer terug op 1 staat (na case), herhaal fix zonder user-interactie
+                    if is_now and auto_apply and self._startup_done:
+                        if now - self._last_verify_ts >= verify_interval:
+                            self._last_verify_ts = now
+                            try:
+                                ch = resolve_channel(addr, channel)
+                                _, msg, reported = _do_rfcomm_write(addr, ch, as_ver,
+                                                                     attempts=max(attempts, 6),
+                                                                     retry_delay=retry_delay,
+                                                                     listen_seconds=listen_seconds)
+                                if reported is not None and reported != as_ver:
+                                    log.warning("re-verify %s asVer=%s verwacht %s -> re-apply (case/power-cycle?)", addr, reported, as_ver)
+                                    self._maybe_fix(addr, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason=f"asVer={reported}->re-apply")
+                                elif reported is None:
+                                    # Geen state maar wel verzonden — niet als fout tellen, wel log
+                                    log.debug("re-verify %s geen state frame: %s", addr, msg)
+                                else:
+                                    log.debug("re-verify %s asVer=%s ok", addr, reported)
+                            except Exception as exc:
+                                log.debug("re-verify %s faalde: %s", addr, exc)
+
+                    self._last_connected[addr] = is_now
 
             except Exception as exc:
                 log.exception("monitor loop error: %s", exc)

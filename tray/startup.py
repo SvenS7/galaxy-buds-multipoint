@@ -16,6 +16,7 @@ from pathlib import Path
 log = logging.getLogger("startup")
 
 TASK_NAME = "GalaxyBudsMultipointFix"
+TASK_NAME_BOOT = "GalaxyBudsMultipointFixBoot"
 REG_VALUE = "GalaxyBudsMultipointFix"
 STARTUP_BASENAME = "Galaxy Buds Multipoint Fix"
 
@@ -56,6 +57,54 @@ def _task_command(minimized: bool = True) -> str:
         args += " --minimized"
     return args
 
+def _task_parts() -> tuple[str, str]:
+    """Splits command in (pythonw.exe, arguments) voor XML."""
+    pyw = _pythonw_for_task()
+    app_py = str(app_dir() / "app.py")
+    args = f'"{app_py}" --minimized'
+    return pyw, args
+
+def _task_xml() -> str:
+    """Task XML met zowel LogonTrigger als BootTrigger (betrouwbaar bij boot én login)."""
+    pyw, args = _task_parts()
+    # XML moet speciale chars escapen; paden bevatten geen &<>, alleen quotes.
+    # Gebruik aparte Command/Arguments velden zoals Task Scheduler verwacht.
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\\{TASK_NAME}</URI>
+    <Description>Galaxy Buds multipoint fix — past asVer=2 toe bij connect</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>
+    <BootTrigger><Enabled>true</Enabled></BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{pyw}</Command>
+      <Arguments>{args}</Arguments>
+    </Exec>
+  </Actions>
+</Task>"""
+
 # ---------------------------------------------------------------------------
 # Task Scheduler
 # ---------------------------------------------------------------------------
@@ -68,31 +117,95 @@ def _run(cmd: list[str], timeout: float = 15) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 def task_exists() -> bool:
-    rc, out, _ = _run(["schtasks", "/query", "/tn", TASK_NAME], timeout=10)
+    # Check zowel logon- als boot-taak (één van beide telt als geïnstalleerd)
+    for name in (TASK_NAME, TASK_NAME_BOOT):
+        rc, _, _ = _run(["schtasks", "/query", "/tn", name], timeout=10)
+        if rc == 0:
+            return True
+    return False
+
+def _task_exists_name(name: str) -> bool:
+    rc, _, _ = _run(["schtasks", "/query", "/tn", name], timeout=10)
     return rc == 0
 
 def install_task() -> tuple[bool, str]:
+    # 1. Probeer XML met zowel LogonTrigger als BootTrigger (echte boot+login)
+    try:
+        import tempfile
+        xml = _task_xml()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False, encoding="utf-16") as f:
+            f.write(xml)
+            xml_path = f.name
+        try:
+            cmd = ["schtasks", "/create", "/tn", TASK_NAME, "/xml", xml_path, "/f"]
+            rc, out, err = _run(cmd, timeout=20)
+            msg = (out + err).strip()
+            if rc == 0:
+                log.info("Task Scheduler taak (XML, logon+boot) aangemaakt: %s", TASK_NAME)
+                return True, f"Task Scheduler taak '{TASK_NAME}' aangemaakt (logon + boot)"
+            log.warning("XML task create failed rc=%d: %s — fallback naar /sc", rc, msg)
+        finally:
+            try:
+                Path(xml_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as exc:
+        log.warning("XML task pad faalde: %s — fallback naar /sc", exc)
+
+    # 2. Fallback: klassieke /sc onlogon + aparte boot-taak
     tr = _task_command(True)
-    # /sc onlogon /rl limited /f /it (interactive)
+    results: list[str] = []
+    ok_any = False
+
+    # onlogon (login)
     cmd = ["schtasks", "/create", "/tn", TASK_NAME, "/tr", tr,
            "/sc", "onlogon", "/rl", "limited", "/f", "/it"]
     rc, out, err = _run(cmd)
     msg = (out + err).strip()
     if rc == 0:
-        log.info("Task Scheduler taak aangemaakt: %s", TASK_NAME)
-        return True, f"Task Scheduler taak '{TASK_NAME}' aangemaakt"
-    log.warning("schtasks create failed rc=%d: %s", rc, msg)
-    return False, f"schtasks failed ({rc}): {msg}"
+        log.info("Task Scheduler taak aangemaakt (onlogon): %s", TASK_NAME)
+        results.append(f"Task Scheduler taak '{TASK_NAME}' (onlogon) aangemaakt")
+        ok_any = True
+    else:
+        log.warning("schtasks onlogon failed rc=%d: %s", rc, msg)
+        results.append(f"schtasks onlogon failed ({rc}): {msg}")
+
+    # onstart (boot) — echte boot-start fallback, zelfde binary
+    cmd2 = ["schtasks", "/create", "/tn", TASK_NAME_BOOT, "/tr", tr,
+            "/sc", "onstart", "/rl", "limited", "/f"]
+    rc2, out2, err2 = _run(cmd2)
+    msg2 = (out2 + err2).strip()
+    if rc2 == 0:
+        log.info("Task Scheduler boot-taak aangemaakt: %s", TASK_NAME_BOOT)
+        results.append(f"Boot-taak '{TASK_NAME_BOOT}' (onstart) aangemaakt")
+        ok_any = True
+    else:
+        # onstart kan falen zonder admin op sommige systemen — geen fatal, fallback via Registry/Startup blijft
+        log.info("schtasks onstart resultaat rc=%d: %s", rc2, msg2)
+
+    if ok_any:
+        return True, " | ".join(results)
+    return False, " | ".join(results)
 
 def remove_task() -> tuple[bool, str]:
-    if not task_exists():
-        return True, f"taak '{TASK_NAME}' bestond niet"
-    rc, out, err = _run(["schtasks", "/delete", "/tn", TASK_NAME, "/f"])
-    msg = (out + err).strip()
-    if rc == 0:
-        log.info("taak verwijderd: %s", TASK_NAME)
-        return True, f"taak '{TASK_NAME}' verwijderd"
-    return False, f"schtasks delete failed ({rc}): {msg}"
+    msgs: list[str] = []
+    found = False
+    for name in (TASK_NAME, TASK_NAME_BOOT):
+        if not _task_exists_name(name):
+            msgs.append(f"taak '{name}' bestond niet")
+            continue
+        found = True
+        rc, out, err = _run(["schtasks", "/delete", "/tn", name, "/f"])
+        msg = (out + err).strip()
+        if rc == 0:
+            log.info("taak verwijderd: %s", name)
+            msgs.append(f"taak '{name}' verwijderd")
+        else:
+            msgs.append(f"schtasks delete {name} failed ({rc}): {msg}")
+    if not found:
+        return True, "geen Task Scheduler taken gevonden"
+    # succes als minstens één verwijderd
+    return True, " | ".join(msgs)
 
 # ---------------------------------------------------------------------------
 # Startup folder + Registry fallback
@@ -202,7 +315,7 @@ def uninstall_autorun() -> list[str]:
     return results
 
 def uninstall_all() -> list[str]:
-    """Volledige uninstall: autorun + logs + temp.
+    """Volledige uninstall: alle autorun entries (logon+boot) + alle logs + temp.
 
     Retourneert lijst van wat verwijderd is (voor user dialoog).
     Stoppen van proces doet de caller (tray App).
@@ -210,17 +323,48 @@ def uninstall_all() -> list[str]:
     msgs: list[str] = []
     msgs.extend(uninstall_autorun())
 
-    # Logs in AppData
+    # Extra: expliciet alle bekende task-namen proberen te verwijderen (ook bij gedeeltelijke install)
+    for name in (TASK_NAME, TASK_NAME_BOOT):
+        try:
+            rc, _, _ = _run(["schtasks", "/query", "/tn", name], timeout=8)
+            if rc == 0:
+                rc2, out2, err2 = _run(["schtasks", "/delete", "/tn", name, "/f"], timeout=10)
+                if rc2 == 0:
+                    msgs.append(f"taak '{name}' alsnog verwijderd")
+        except Exception:
+            pass
+
+    # Startup folder: bat + lnk + evt. oude varianten
+    for p in [startup_lnk_path(), startup_bat_path(),
+              startup_folder() / f"{TASK_NAME}.lnk",
+              startup_folder() / f"{TASK_NAME}.bat"]:
+        try:
+            if p.exists():
+                p.unlink()
+                msgs.append(f"Startup item verwijderd: {p.name}")
+        except Exception as exc:
+            msgs.append(str(exc))
+
+    # Logs in AppData — volledige boom verwijderen
     for p in [logs_dir(), appdata_local() / "GalaxyBudsMultipoint"]:
         try:
             if p.exists():
-                # behoud folder maar wis inhoud, of wis helemaal?
                 shutil.rmtree(p, ignore_errors=False)
                 msgs.append(f"logs verwijderd: {p}")
             else:
                 msgs.append(f"geen logs op {p}")
         except Exception as exc:
             msgs.append(f"kon {p} niet verwijderen: {exc}")
+
+    # AppData config (zodat herinstall schoon start)
+    for cfg in [appdata_local() / "GalaxyBudsMultipoint" / "config.json",
+                Path(os.environ.get("APPDATA", "")) / "GalaxyBudsMultipoint" / "config.json"]:
+        try:
+            if cfg.exists():
+                cfg.unlink()
+                msgs.append(f"config verwijderd: {cfg}")
+        except Exception as exc:
+            msgs.append(str(exc))
 
     # Lokale logs/
     local_logs = app_dir() / "logs"
@@ -234,6 +378,14 @@ def uninstall_all() -> list[str]:
                     msgs.append(str(exc))
     except Exception as exc:
         msgs.append(str(exc))
+
+    # Lock file
+    try:
+        lock = Path(os.environ.get("TEMP", str(Path.home()))) / "GalaxyBudsMultipointFix.lock"
+        if lock.exists():
+            lock.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     # Temp wake files
     import tempfile, glob
@@ -254,5 +406,5 @@ def uninstall_all() -> list[str]:
     except Exception as exc:
         msgs.append(str(exc))
 
-    msgs.append("Uninstall voltooid — herstart indien nodig om tray te verbergen")
+    msgs.append("Uninstall voltooid — autorun + logs volledig verwijderd. Herstart indien nodig om tray te verbergen.")
     return msgs
