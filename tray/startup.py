@@ -324,15 +324,20 @@ def uninstall_all() -> list[str]:
         except Exception as exc:
             msgs.append(str(exc))
 
-    for p in [logs_dir(), appdata_local() / "GalaxyBudsMultipoint"]:
-        try:
-            if p.exists():
-                shutil.rmtree(p, ignore_errors=False)
-                msgs.append(f"logs removed: {p}")
-            else:
-                msgs.append(f"no logs at {p}")
-        except Exception as exc:
-            msgs.append(f"could not remove {p}: {exc}")
+    # remove logs — only need to remove parent once (covers logs_dir child)
+    base = appdata_local() / "GalaxyBudsMultipoint"
+    ld = logs_dir()
+    try:
+        if base.exists():
+            shutil.rmtree(base, ignore_errors=False)
+            msgs.append(f"logs removed: {base}")
+        elif ld.exists():
+            shutil.rmtree(ld, ignore_errors=False)
+            msgs.append(f"logs removed: {ld}")
+        else:
+            msgs.append(f"no logs at {base}")
+    except Exception as exc:
+        msgs.append(f"could not remove {base}: {exc}")
 
     for cfg in [appdata_local() / "GalaxyBudsMultipoint" / "config.json",
                 Path(os.environ.get("APPDATA", "")) / "GalaxyBudsMultipoint" / "config.json"]:

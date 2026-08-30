@@ -25,7 +25,7 @@ from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
 # ---------------------------------------------------------------------------
-# Logging setup — lokaal + AppData
+# Logging setup — local + AppData
 # ---------------------------------------------------------------------------
 
 def _appdata_logs_dir() -> Path:
@@ -39,6 +39,20 @@ def setup_logging(verbose: bool = False) -> Path:
     fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
+    # avoid duplicate handlers on re-import / repeated setup_logging calls
+    if root.handlers:
+        for h in list(root.handlers):
+            # keep existing handlers but update level
+            h.setLevel(level)
+        root.setLevel(level)
+        # find existing file log path if any
+        for h in root.handlers:
+            if isinstance(h, RotatingFileHandler):
+                try:
+                    return Path(h.baseFilename)
+                except Exception:
+                    pass
+        return _appdata_logs_dir() / "app.log"
     root.setLevel(level)
     # console
     ch = logging.StreamHandler(sys.stderr)
@@ -88,7 +102,7 @@ def load_config() -> dict:
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
                 cfg.update(data)
-                logging.getLogger("app").info("config geladen: %s", p)
+                logging.getLogger("app").info("config loaded: %s", p)
             except Exception as exc:
                 logging.getLogger("app").warning("could not read %s: %s", p, exc)
     # defaults
@@ -151,18 +165,50 @@ def main(argv=None) -> int:
 
     # single-instance guard — prevent duplicate tray on double-click/autorun race
     lock_path = Path(os.environ.get("TEMP", str(Path.home()))) / "GalaxyBudsMultipointFix.lock"
+    def _cleanup_lock():
+        try:
+            if lock_path.exists():
+                try:
+                    if int(lock_path.read_text(encoding="utf-8").strip()) == os.getpid():
+                        lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    import atexit
+    atexit.register(_cleanup_lock)
     try:
         if lock_path.exists():
             try:
                 pid = int(lock_path.read_text(encoding="utf-8").strip())
                 import subprocess as _sp
+                import re
                 rc = _sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5)
-                if str(pid) in rc.stdout:
+                # tasklist prints PID as exact number; use word boundary to avoid substring false positives
+                # and verify the PID actually exists in output
+                if re.search(rf"\b{pid}\b", rc.stdout) and "INFO:" not in rc.stdout:
                     print(f"App already running (PID {pid}) — focus tray instead of second instance.", file=sys.stderr)
                     sys.exit(0)
+                else:
+                    # stale lock (PID not running or PID reuse but task not found)
+                    try:
+                        lock_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            except ValueError:
+                # corrupt lock file
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            except SystemExit:
+                raise
             except Exception:
                 pass
+        # atomic-ish create: write PID
         lock_path.write_text(str(os.getpid()), encoding="utf-8")
+    except SystemExit:
+        raise
     except Exception:
         pass
 
@@ -223,8 +269,9 @@ def main(argv=None) -> int:
             r.destroy()
         except Exception:
             pass
-        if args.status:
             return do_status(config)
+        # --install without --status should exit after installing
+        return 0
 
     if args.status:
         return do_status(config)
@@ -258,24 +305,28 @@ def main(argv=None) -> int:
     log.info("monitor started (poll %.1fs debounce %.1fs)", config["poll_interval"], config["debounce_seconds"])
 
     # Tray (blocks until Exit)
+    exit_code = 0
     try:
         import tray_app
         app = tray_app.TrayApp(config, monitor)
         app.run()
     except Exception as exc:
         log.exception("tray crash: %s", exc)
-        print(f"tray could not start ({exc}) — monitor stays active. Ctrl+C to stop.", file=sys.stderr)
+        print(f"tray could not start ({exc}) — exiting.", file=sys.stderr)
         try:
-            import time
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
+            from tkinter import Tk, messagebox
+            r = Tk(); r.withdraw()
+            messagebox.showerror("Galaxy Buds Multipoint Fix", f"Tray failed to start:\n{exc}\n\nCheck logs for details.")
+            r.destroy()
+        except Exception:
             pass
+        exit_code = 1
     finally:
         monitor.stop()
         log.info("app closed")
+        _cleanup_lock()
 
-    return 0
+    return exit_code
 
 if __name__ == "__main__":
     raise SystemExit(main())

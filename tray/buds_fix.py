@@ -95,8 +95,8 @@ def _do_rfcomm_write(address: str, channel: int, as_ver: int,
             return True, f"asVer={reported} ({'multipoint allowed' if allowed else 'blocked'})", reported
         if len({s.as_ver for s in states}) > 1:
             first = states[0].as_ver
-            return False, f"wrote {as_ver} maar device reports {reported} (was {first})", reported
-        return False, f"wrote {as_ver} maar device reports {reported}", reported
+            return False, f"wrote {as_ver} but device reports {reported} (was {first})", reported
+        return False, f"wrote {as_ver} but device reports {reported}", reported
     finally:
         _rfcomm_lock.release()
 
@@ -142,14 +142,15 @@ def check_status(name_needle: str = "buds", address: str | None = None,
     if reported is not None:
         return BudsStatus(True, dev.connected, dev.address, dev.name,
                           reported, frame.multipoint_allowed(reported), None)
-    if not ok and "open failed" in msg.lower():
+    if not ok:
+        # propagate actual error (open failed, RFCOMM busy, open error, etc.)
         return BudsStatus(True, dev.connected, dev.address, dev.name, None, None, msg)
     return BudsStatus(True, dev.connected, dev.address, dev.name, None, None,
                       "no state frame (buds sleeping? start playback)")
 
 
 # ---------------------------------------------------------------------------
-# Helpers voor robuuste detectie
+# Helpers for robust detection
 # ---------------------------------------------------------------------------
 
 def _can_open_rfcomm(address: str, channel: int | None, attempts: int = 2,
@@ -158,11 +159,16 @@ def _can_open_rfcomm(address: str, channel: int | None, attempts: int = 2,
 
     Serialized via same lock to avoid 10048; short timeout.
     """
+    # resolve channel BEFORE acquiring lock — it shells out to PowerShell
+    # and would block other RFCOMM operations unnecessarily
+    try:
+        ch = resolve_channel(address, channel)
+    except Exception:
+        return False
     acquired = _rfcomm_lock.acquire(timeout=8)
     if not acquired:
         return False
     try:
-        ch = resolve_channel(address, channel)
         try:
             transport.bluetooth_family()
         except transport.Unsupported:
@@ -201,8 +207,8 @@ class BudsMonitor(threading.Thread):
         self.on_status = on_status
         self._stop = threading.Event()
         self._last_connected: dict[str, bool] = {}
-        self._last_fix_ts: float = 0.0
-        self._last_verify_ts: float = 0.0
+        self._last_fix_ts: dict[str, float] = {}
+        self._last_verify_ts: dict[str, float] = {}
         self._last_disconnected_probe: dict[str, float] = {}
         self._last_status: BudsStatus | None = None
         self._startup_done = False
@@ -234,9 +240,10 @@ class BudsMonitor(threading.Thread):
         debounce = float(self.config.get("debounce_seconds", 20.0))
         # Re-apply after case/power-cycle (asVer back to 1) must bypass debounce
         bypass = reason in ("startup",) or reason.startswith("asVer=")
-        if now - self._last_fix_ts < debounce and not bypass:
+        last_ts = self._last_fix_ts.get(addr, 0.0)
+        if now - last_ts < debounce and not bypass:
             log.info("fix skip %s debounce %.0fs remaining (%s)", addr,
-                     debounce - (now - self._last_fix_ts), reason)
+                     debounce - last_ts, reason)
             return
         log.info("auto fix trigger %s \"%s\" reason=%s asVer=%d", addr, name, reason, as_ver)
         if self.on_event:
@@ -247,8 +254,9 @@ class BudsMonitor(threading.Thread):
                             attempts=max(attempts, 10),
                             retry_delay=retry_delay,
                             listen_seconds=listen_seconds)
-        self._last_fix_ts = time.monotonic()
-        self._last_verify_ts = self._last_fix_ts
+        ts = time.monotonic()
+        self._last_fix_ts[addr] = ts
+        self._last_verify_ts[addr] = ts
         level = logging.INFO if ok else logging.WARNING
         log.log(level, "auto fix %s (%s): %s", addr, reason, msg)
         if self.on_event:
@@ -294,11 +302,12 @@ class BudsMonitor(threading.Thread):
                             self._maybe_fix(dev.address, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason="startup")
                         elif reported is not None:
                             log.info("startup-check %s asVer=%s ok — no fix needed", dev.address, reported)
-                            self._last_fix_ts = time.monotonic()
-                            self._last_verify_ts = time.monotonic()
+                            ts = time.monotonic()
+                            self._last_fix_ts[dev.address] = ts
+                            self._last_verify_ts[dev.address] = ts
                         else:
                             log.info("startup-check %s no state frame — inconclusive, no auto-fix", dev.address)
-                            self._last_verify_ts = time.monotonic()
+                            self._last_verify_ts[dev.address] = time.monotonic()
                 self._startup_done = True
             except Exception as exc:
                 log.debug("startup check failed (non-fatal): %s", exc)
@@ -351,7 +360,7 @@ class BudsMonitor(threading.Thread):
                     if was is True and is_now is False and not probed:
                         log.info("disconnect detected %s \"%s\"", addr, dev.name)
                         self._last_connected[addr] = False
-                        self._last_verify_ts = 0
+                        self._last_verify_ts[addr] = 0
                         if self.on_event:
                             self.on_event(f"Buds disconnected: {dev.name}")
                         continue
@@ -363,8 +372,9 @@ class BudsMonitor(threading.Thread):
 
                     # Already connected — periodic re-verify for case/power-cycle
                     if is_now and auto_apply and self._startup_done:
-                        if now - self._last_verify_ts >= verify_interval:
-                            self._last_verify_ts = now
+                        last_v = self._last_verify_ts.get(addr, 0)
+                        if now - last_v >= verify_interval:
+                            self._last_verify_ts[addr] = now
                             try:
                                 ch = resolve_channel(addr, channel)
                                 _, msg, reported = _do_rfcomm_write(addr, ch, as_ver,

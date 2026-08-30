@@ -10,6 +10,29 @@ from tkinter import Tk, Toplevel, Label, Button, Text, Frame, END, messagebox
 
 log = logging.getLogger("tray")
 
+# cache autorun check to avoid blocking pystray menu thread with schtasks /query (10s timeout)
+_autorun_cache: tuple[float, bool] | None = None
+_AUTORUN_TTL = 5.0  # seconds
+
+def _cached_autorun() -> bool:
+    import time
+    global _autorun_cache
+    now = time.monotonic()
+    if _autorun_cache is not None:
+        ts, val = _autorun_cache
+        if now - ts < _AUTORUN_TTL:
+            return val
+    try:
+        val = startup.is_installed()
+    except Exception:
+        val = False
+    _autorun_cache = (now, val)
+    return val
+
+def _invalidate_autorun_cache():
+    global _autorun_cache
+    _autorun_cache = None
+
 try:
     import pystray
     from pystray import MenuItem as item
@@ -61,7 +84,7 @@ class StatusWindow:
         self._build_hidden()
 
     def _build_hidden(self):
-        # root is hidden; window wordt on-demand getoond
+        # root is hidden; window is shown on demand
         pass
 
     def show(self):
@@ -146,24 +169,34 @@ class StatusWindow:
         if self.win is None or not self.win.winfo_exists():
             return
         try:
-            autorun_on = startup.is_installed()
+            _invalidate_autorun_cache()
+            autorun_on = _cached_autorun()
             self.labels["autorun"].config(text=f"Autorun: {'on' if autorun_on else 'off'} (start at login)")
         except Exception:
             pass
         self._schedule_refresh()
 
     def refresh_now(self, silent: bool = False):
-        if silent:
-            return
-        self.labels["fix"].config(text="Fix: checking…")
-        self.win.update_idletasks()
+        # silent=True: refresh data in background without touching labels immediately
+        # (used after Run fix / Revert / Autorun toggle so window updates without flicker)
+        if not silent:
+            if self.win is None or not self.win.winfo_exists():
+                return
+            self.labels["fix"].config(text="Fix: checking…")
+            try:
+                self.win.update_idletasks()
+            except Exception:
+                pass
 
         def worker():
             try:
                 st = self.get_status_fn()
                 self.root.after(0, lambda: self._apply_status(st))
             except Exception as exc:
-                self.root.after(0, lambda: self._apply_error(str(exc)))
+                if not silent:
+                    self.root.after(0, lambda: self._apply_error(str(exc)))
+                else:
+                    log.debug("silent refresh failed: %s", exc)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -179,7 +212,8 @@ class StatusWindow:
             self.labels["fix"].config(text=f"Fix: asVer={st.as_ver} — multipoint {ok}")
         self.labels["addr"].config(text=f"Address: {st.address or '—'}  \"{st.name or ''}\"")
         try:
-            autorun_on = startup.is_installed()
+            _invalidate_autorun_cache()
+            autorun_on = _cached_autorun()
             self.labels["autorun"].config(text=f"Autorun: {'on' if autorun_on else 'off'} (start at login)")
         except Exception:
             pass
@@ -325,34 +359,40 @@ class TrayApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_autorun_enable(self, icon, item):
-        def do_ui():
-            msgs = startup.install_autorun()
+        def worker():
+            try:
+                msgs = startup.install_autorun()
+            except Exception as exc:
+                msgs = [f"Autorun enable failed: {exc}"]
+                log.exception("autorun enable failed")
+            _invalidate_autorun_cache()
             self._notify("Autorun enabled", msgs[0] if msgs else "Autorun on")
+            for m in msgs:
+                self._event_q.put(m)
             if self.root:
-                self.root.after(0, lambda: messagebox.showinfo("Autorun enabled", "\n".join(msgs)))
-            if self.status_win:
-                for m in msgs:
-                    self._event_q.put(m)
-            self._refresh_menu()
-        if self.root:
-            self.root.after(0, do_ui)
-        else:
-            do_ui()
+                self.root.after(0, lambda msgs=msgs: messagebox.showinfo("Autorun enabled", "\n".join(msgs)))
+                self.root.after(0, self._refresh_menu)
+            else:
+                self._refresh_menu()
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_autorun_disable(self, icon, item):
-        def do_ui():
-            msgs = startup.uninstall_autorun()
+        def worker():
+            try:
+                msgs = startup.uninstall_autorun()
+            except Exception as exc:
+                msgs = [f"Autorun disable failed: {exc}"]
+                log.exception("autorun disable failed")
+            _invalidate_autorun_cache()
             self._notify("Autorun disabled", msgs[0] if msgs else "Autorun off")
+            for m in msgs:
+                self._event_q.put(m)
             if self.root:
-                self.root.after(0, lambda: messagebox.showinfo("Autorun disabled", "\n".join(msgs)))
-            if self.status_win:
-                for m in msgs:
-                    self._event_q.put(m)
-            self._refresh_menu()
-        if self.root:
-            self.root.after(0, do_ui)
-        else:
-            do_ui()
+                self.root.after(0, lambda msgs=msgs: messagebox.showinfo("Autorun disabled", "\n".join(msgs)))
+                self.root.after(0, self._refresh_menu)
+            else:
+                self._refresh_menu()
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_uninstall(self, icon, item):
         def do_ui():
@@ -364,9 +404,22 @@ class TrayApp:
                                        "• Logs and temp files\n\n"
                                        "The app itself (exe/py) stays — delete manually if desired."):
                 return
-            msgs = startup.uninstall_all()
-            messagebox.showinfo("Uninstall complete", "\n".join(msgs))
-            self._on_exit(icon, item)
+            def worker():
+                try:
+                    msgs = startup.uninstall_all()
+                except Exception as exc:
+                    msgs = [f"Uninstall failed: {exc}"]
+                    log.exception("uninstall failed")
+                if self.root:
+                    self.root.after(0, lambda msgs=msgs: messagebox.showinfo("Uninstall complete", "\n".join(msgs)))
+                    self.root.after(0, lambda: self._on_exit(icon, item))
+                else:
+                    try:
+                        messagebox.showinfo("Uninstall complete", "\n".join(msgs))
+                    except Exception:
+                        pass
+                    self._on_exit(icon, item)
+            threading.Thread(target=worker, daemon=True).start()
         if self.root:
             self.root.after(0, do_ui)
 
@@ -395,16 +448,10 @@ class TrayApp:
             log.info("%s: %s", title, msg)
 
     def _is_autorun_on(self, item):
-        try:
-            return startup.is_installed()
-        except Exception:
-            return False
+        return _cached_autorun()
 
     def _is_autorun_off(self, item):
-        try:
-            return not startup.is_installed()
-        except Exception:
-            return True
+        return not _cached_autorun()
 
     def _refresh_menu(self):
         if self.icon:
