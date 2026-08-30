@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Entrypoint — tray-first. Dubbelklik of `uv run app.py` toont direct de systeemtray.
+"""Entrypoint — tray-first. Double-click or `uv run app.py` shows the system tray immediately.
 
-Alle bediening zit in de tray (rechtsklik):
-  Open / Check Buds status / Run fix now / Revert fix / Autorun aan/uit / Uninstall / Sluiten
+All control lives in the tray (right-click):
+  Open / Check Buds status / Run fix now / Revert fix / Enable/Disable Autorun / Uninstall / Close
 
-CLI-flags zijn alleen voor debug; normaal gebruik heeft geen CLI nodig.
+CLI flags are for debugging only; normal use needs no CLI.
   uv run app.py                 # start tray
-  uv run app.py --minimized     # start verborgen (voor Task Scheduler / exe)
+  uv run app.py --minimized     # start hidden (for Task Scheduler / exe)
+
+Based on https://github.com/id6917824/galaxy-buds-multipoint (MIT)
+by id6917824 — original reverse-engineering and fix logic (frame/transport/discover).
+Windows tray extension by SvenS7 — tray/monitor/autorun/uninstall.
+This tray is Windows UI/autorun only and reuses budsmp/* unchanged.
 """
 
 from __future__ import annotations
@@ -49,10 +54,10 @@ def setup_logging(verbose: bool = False) -> Path:
         fh.setFormatter(fmt)
         root.addHandler(fh)
     except Exception as exc:
-        logging.getLogger("app").warning("kon AppData log niet openen: %s", exc)
+        logging.getLogger("app").warning("could not open AppData log: %s", exc)
         log_path = Path(__file__).resolve().parent / "logs" / "app.log"
 
-    # file: lokale logs/
+    # file: local logs/
     try:
         local = Path(__file__).resolve().parent / "logs" / "app.log"
         local.parent.mkdir(parents=True, exist_ok=True)
@@ -63,7 +68,7 @@ def setup_logging(verbose: bool = False) -> Path:
     except Exception:
         pass
 
-    logging.getLogger("app").info("logging naar %s", log_path)
+    logging.getLogger("app").info("logging to %s", log_path)
     return log_path
 
 # ---------------------------------------------------------------------------
@@ -71,7 +76,7 @@ def setup_logging(verbose: bool = False) -> Path:
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    """Laad config.json (naast app.py, dan AppData override)."""
+    """Load config.json (next to app.py, then AppData override)."""
     cfg: dict = {}
     candidates = [
         Path(__file__).resolve().parent / "config.json",
@@ -85,7 +90,7 @@ def load_config() -> dict:
                 cfg.update(data)
                 logging.getLogger("app").info("config geladen: %s", p)
             except Exception as exc:
-                logging.getLogger("app").warning("kon %s niet lezen: %s", p, exc)
+                logging.getLogger("app").warning("could not read %s: %s", p, exc)
     # defaults
     cfg.setdefault("name_needle", "buds")
     cfg.setdefault("address", None)
@@ -107,11 +112,11 @@ def load_config() -> dict:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    # Tray is primair; CLI is alleen debug/advanced. Help toont daarom minimale uitleg.
-    p = argparse.ArgumentParser(description="Galaxy Buds Multipoint Fix — tray app (bediening via systeemtray, rechtsklik icoon)")
-    p.add_argument("--minimized", action="store_true", help="start tray verborgen (voor autorun/exe)")
+    # Tray is primary; CLI is debug/advanced only. Help shows minimal info.
+    p = argparse.ArgumentParser(description="Galaxy Buds Multipoint Fix — tray app (control via system tray, right-click icon)")
+    p.add_argument("--minimized", action="store_true", help="start tray hidden (for autorun/exe)")
     p.add_argument("--verbose", action="store_true", help="debug logging")
-    # Geavanceerd / debug (optioneel, niet nodig voor normaal gebruik):
+    # Advanced / debug (optional, not needed for normal use):
     p.add_argument("--install", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--uninstall", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--status", action="store_true", help=argparse.SUPPRESS)
@@ -133,29 +138,27 @@ def do_status(config: dict):
     print(f"Connected: {st.connected}")
     print(f"Address: {st.address or '—'}  Name: {st.name or '—'}")
     if st.as_ver is not None:
-        print(f"asVer: {st.as_ver}  multipoint: {'toegestaan' if st.multipoint_allowed else 'geblokkeerd'}")
+        print(f"asVer: {st.as_ver}  multipoint: {'allowed' if st.multipoint_allowed else 'blocked'}")
     else:
-        print("asVer: onbekend (geen verify — buds slapen of geen state frame)")
+        print("asVer: unknown (no verify — buds sleeping or no state frame)")
     if st.last_error:
-        print(f"Opmerking: {st.last_error}")
+        print(f"Note: {st.last_error}")
     return 0 if st.paired else 2
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # single-instance guard — voorkom dubbele tray bij dubbelklik/autorun race
+    # single-instance guard — prevent duplicate tray on double-click/autorun race
     lock_path = Path(os.environ.get("TEMP", str(Path.home()))) / "GalaxyBudsMultipointFix.lock"
     try:
-        # Use exclusive create; if exists, check if owning pid still alive
         if lock_path.exists():
             try:
                 pid = int(lock_path.read_text(encoding="utf-8").strip())
-                # check if process still running (Windows: use OpenProcess via psutil fallback)
                 import subprocess as _sp
                 rc = _sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5)
                 if str(pid) in rc.stdout:
-                    print(f"App draait al (PID {pid}) — focus tray in plaats van tweede instantie.", file=sys.stderr)
+                    print(f"App already running (PID {pid}) — focus tray instead of second instance.", file=sys.stderr)
                     sys.exit(0)
             except Exception:
                 pass
@@ -164,7 +167,7 @@ def main(argv=None) -> int:
         pass
 
     setup_logging(verbose=args.verbose)
-    # Bij --minimized: console stilhouden (alleen file logs), tray blijft leidend
+    # When --minimized: keep console quiet (file logs only), tray remains primary
     if args.minimized:
         for h in logging.getLogger().handlers:
             if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
@@ -185,16 +188,15 @@ def main(argv=None) -> int:
     # --uninstall
     if args.uninstall:
         import startup
-        log.info("uninstall aangevraagd")
+        log.info("uninstall requested")
         msgs = startup.uninstall_all()
         for m in msgs:
             print(m)
             log.info(m)
-        # Probeer ook GUI dialoog indien mogelijk
         try:
             from tkinter import Tk, messagebox
             r = Tk(); r.withdraw()
-            messagebox.showinfo("Uninstall voltooid", "\n".join(msgs))
+            messagebox.showinfo("Uninstall complete", "\n".join(msgs))
             r.destroy()
         except Exception:
             pass
@@ -203,7 +205,7 @@ def main(argv=None) -> int:
     # --install
     if args.install:
         import startup
-        log.info("install aangevraagd")
+        log.info("install requested")
         msgs = startup.install_autorun()
         for m in msgs:
             print(m)
@@ -211,37 +213,35 @@ def main(argv=None) -> int:
         try:
             from tkinter import Tk, messagebox
             r = Tk(); r.withdraw()
-            # check of taak bestaat
             if startup.task_exists():
-                messagebox.showinfo("Installatie voltooid",
-                                    "Autorun geïnstalleerd:\n" + "\n".join(msgs) +
-                                    "\n\nDe app start automatisch bij volgende login.")
+                messagebox.showinfo("Install complete",
+                                    "Autorun installed:\n" + "\n".join(msgs) +
+                                    "\n\nThe app will start automatically at next login.")
             else:
-                messagebox.showwarning("Installatie",
-                                       "Task Scheduler mislukt, fallback gebruikt:\n" + "\n".join(msgs))
+                messagebox.showwarning("Install",
+                                       "Task Scheduler failed, fallback used:\n" + "\n".join(msgs))
             r.destroy()
         except Exception:
             pass
-        # na install meteen tray starten tenzij --status
         if args.status:
             return do_status(config)
 
     if args.status:
         return do_status(config)
 
-    # Autorun wordt NIET automatisch geïnstalleerd — gebruiker beheert dit via tray:
-    #   Tray > Autorun inschakelen / Autorun uitschakelen
-    # Alleen loggen wat de huidige status is.
+    # Autorun is NOT installed automatically — user controls via tray:
+    #   Tray > Enable Autorun / Disable Autorun
+    # Only log current status.
     try:
         import startup
         if startup.is_installed():
-            log.info("autorun: aan (Task Scheduler / Startup)")
+            log.info("autorun: on (Task Scheduler / Startup)")
         else:
-            log.info("autorun: uit — inschakelen via tray > Autorun inschakelen")
+            log.info("autorun: off — enable via tray > Enable Autorun")
     except Exception:
         pass
 
-    # Verberg console window bij --minimized (Windows)
+    # Hide console window when --minimized (Windows)
     if args.minimized and sys.platform == "win32":
         try:
             import ctypes
@@ -255,17 +255,16 @@ def main(argv=None) -> int:
     import buds_fix
     monitor = buds_fix.BudsMonitor(config)
     monitor.start()
-    log.info("monitor gestart (poll %.1fs debounce %.1fs)", config["poll_interval"], config["debounce_seconds"])
+    log.info("monitor started (poll %.1fs debounce %.1fs)", config["poll_interval"], config["debounce_seconds"])
 
-    # Tray (blokkeert tot Exit)
+    # Tray (blocks until Exit)
     try:
         import tray_app
         app = tray_app.TrayApp(config, monitor)
         app.run()
     except Exception as exc:
         log.exception("tray crash: %s", exc)
-        # Fallback: blijf monitor draaien zonder tray (voor headless)
-        print(f"tray kon niet starten ({exc}) — monitor blijft actief. Ctrl+C om te stoppen.", file=sys.stderr)
+        print(f"tray could not start ({exc}) — monitor stays active. Ctrl+C to stop.", file=sys.stderr)
         try:
             import time
             while True:
@@ -274,7 +273,7 @@ def main(argv=None) -> int:
             pass
     finally:
         monitor.stop()
-        log.info("app afgesloten")
+        log.info("app closed")
 
     return 0
 

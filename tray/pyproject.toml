@@ -1,11 +1,16 @@
 [project]
 name = "galaxy-buds-multipoint-tray"
 version = "0.1.0"
-description = "Compact Windows tray-app die automatisch de Galaxy Buds multipoint-fix (asVer=2 via SPPSERVICE4) toepast bij iedere Bluetooth-connectie."
+description = "A compact Windows tray app that automatically applies the Galaxy Buds multipoint fix (asVer=2 via SPPSERVICE4) to every Bluetooth connection. Based on https://github.com/id6917824/galaxy-buds-multipoint."
+
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "galaxy-buds-multipoint" }]
+authors = [
+    { name = "id6917824", email = "id6917824@github" },
+    { name = "SvenS7", email = "SvenS7@github" },
+    { name = "galaxy-buds-multipoint contributors" },
+]
 dependencies = [
     "pystray>=0.19",
     "Pillow>=10",
