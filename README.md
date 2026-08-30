@@ -174,6 +174,8 @@ the buds in Settings first, then see [windows/README.md](windows/README.md).
 
 No CLI needed — fully tray-driven. See [tray/README.md](tray/README.md).
 
+> **Download EXE (Releases):** `BudsFix.exe` (onefile, single exe) and `BudsFix-standalone.zip` (folder with exe + DLLs). Note: antivirus may flag the onefile as virus because it is packaged with Nuitka onefile — if that happens, use the standalone zip instead.
+
 ```powershell
 cd tray
 uv sync

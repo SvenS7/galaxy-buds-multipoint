@@ -4,6 +4,8 @@
 
 Compact Windows Python app that automatically applies `budsmp apply` (`asVer=2` via `SPPSERVICE4` RFCOMM) whenever your paired Galaxy Buds connect. **Fully tray-driven — no CLI needed.**
 
+> **Releases:** `BudsFix.exe` (onefile, single exe) and `BudsFix-standalone.zip` (folder with exe + DLLs). Note: antivirus may flag the onefile as virus because it is packaged with Nuitka onefile — if that happens, use the standalone zip instead.
+
 - Double-click `app.py` / `uv run app.py` / later `BudsFix.exe` → blue **B** icon in the system tray
 - Right-click the tray for everything (status, fix, autorun, uninstall)
 - Optional auto-start at login/boot (Task Scheduler)

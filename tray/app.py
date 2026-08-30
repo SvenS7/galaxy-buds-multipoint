@@ -183,7 +183,16 @@ def main(argv=None) -> int:
                 pid = int(lock_path.read_text(encoding="utf-8").strip())
                 import subprocess as _sp
                 import re
-                rc = _sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5)
+                _hk: dict = {}
+                if sys.platform == "win32":
+                    try:
+                        _si = _sp.STARTUPINFO()  # type: ignore[attr-defined]
+                        _si.dwFlags |= _sp.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+                        _si.wShowWindow = 0  # SW_HIDE — required with STARTF_USESHOWWINDOW
+                        _hk = {"startupinfo": _si, "creationflags": _sp.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+                    except Exception:
+                        _hk = {}
+                rc = _sp.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=5, **_hk)
                 # tasklist prints PID as exact number; use word boundary to avoid substring false positives
                 # and verify the PID actually exists in output
                 if re.search(rf"\b{pid}\b", rc.stdout) and "INFO:" not in rc.stdout:

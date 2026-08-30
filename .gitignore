@@ -17,6 +17,22 @@ __pycache__/
 .venv/
 venv/
 
+# tray / nuitka / pyinstaller
+tray/build/
+tray/dist/
+tray/*.exe
+tray/*.dist/
+tray/*.build/
+tray/*.onefile-build/
+tray/*.zip
+tray/build.log
+tray/build-onefile.log
+tray/build-standalone.log
+*.exe
+*.zip
+*.dist/
+*.build/
+
 # editors / os
 .DS_Store
 .idea/

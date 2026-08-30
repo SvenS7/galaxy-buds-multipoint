@@ -47,12 +47,25 @@ def normalize_address(s: str) -> str:
     return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
 
 
+def _hidden_kwargs() -> dict:
+    """Hide console window on Windows — prevents flash every 3s during polling."""
+    if sys.platform == "win32":
+        try:
+            si = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+            si.wShowWindow = 0  # SW_HIDE — required with STARTF_USESHOWWINDOW
+            return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return {}
+
+
 def _run(cmd: list[str], timeout: float = 12.0) -> str | None:
     """Run a helper and return stdout, or None if it is missing or unhappy."""
     if not shutil.which(cmd[0]):
         return None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **_hidden_kwargs())
     except (OSError, subprocess.SubprocessError):
         return None
     return p.stdout if p.returncode == 0 else None

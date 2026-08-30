@@ -1,0 +1,167 @@
+name: Build EXE on Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-standalone:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies (tray)
+        working-directory: tray
+        run: uv sync
+
+      - name: Resolve version
+        id: version
+        working-directory: tray
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path pyproject.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $ver) { throw "could not parse version from pyproject.toml" }
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $tagVer = "${{ github.ref_name }}".TrimStart("v")
+            if ($tagVer) { $ver = $tagVer }
+          }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+          echo "Resolved version: $ver"
+
+      - name: Build EXE with Nuitka (standalone — VT-clean)
+        working-directory: tray
+        timeout-minutes: 30
+        run: |
+          uv run --with nuitka python -m nuitka `
+            --standalone `
+            --assume-yes-for-downloads `
+            --windows-console-mode=disable `
+            --enable-plugin=tk-inter `
+            --windows-company-name="SvenS7" `
+            --windows-product-name="Galaxy Buds Multipoint Fix" `
+            --windows-file-version=${{ steps.version.outputs.version }} `
+            --windows-product-version=${{ steps.version.outputs.version }} `
+            --windows-file-description="Galaxy Buds Multipoint Fix - Tray App" `
+            --include-data-files=config.json=config.json `
+            --output-filename=BudsFix.exe `
+            app.py
+
+      - name: Zip standalone (if AV flags onefile)
+        working-directory: tray
+        shell: pwsh
+        run: |
+          $dist = $null
+          if (Test-Path app.dist/BudsFix.exe) { $dist = "app.dist" }
+          elseif (Test-Path BudsFix.dist/BudsFix.exe) { $dist = "BudsFix.dist" }
+          if (-not $dist) { Get-ChildItem -Recurse -Filter BudsFix.exe | Out-String -Width 200; Get-ChildItem -Recurse app.* | Out-String -Width 200; throw "standalone build missing (expected app.dist/BudsFix.exe or BudsFix.dist/BudsFix.exe)" }
+          Compress-Archive -Path "$dist/*" -DestinationPath BudsFix-standalone.zip -Force
+          Get-ChildItem BudsFix-standalone.zip, "$dist/BudsFix.exe" | Format-List Name,Length,LastWriteTime
+          certutil -hashfile BudsFix-standalone.zip SHA256
+
+      - name: Attach standalone zip to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tray/BudsFix-standalone.zip
+          fail_on_unmatched_files: true
+
+      - name: Upload artifact (manual dispatch) — standalone
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BudsFix-standalone
+          path: tray/BudsFix-standalone.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-onefile:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies (tray)
+        working-directory: tray
+        run: uv sync
+
+      - name: Resolve version
+        id: version
+        working-directory: tray
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path pyproject.toml -Pattern '^\s*version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $ver) { throw "could not parse version from pyproject.toml" }
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $tagVer = "${{ github.ref_name }}".TrimStart("v")
+            if ($tagVer) { $ver = $tagVer }
+          }
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+          echo "Resolved version: $ver"
+
+      - name: Build EXE with Nuitka (onefile — single exe, convenient)
+        working-directory: tray
+        timeout-minutes: 30
+        run: |
+          uv run --with nuitka python -m nuitka `
+            --onefile `
+            --assume-yes-for-downloads `
+            --windows-console-mode=disable `
+            --enable-plugin=tk-inter `
+            --windows-company-name="SvenS7" `
+            --windows-product-name="Galaxy Buds Multipoint Fix" `
+            --windows-file-version=${{ steps.version.outputs.version }} `
+            --windows-product-version=${{ steps.version.outputs.version }} `
+            --windows-file-description="Galaxy Buds Multipoint Fix - Tray App" `
+            --include-data-files=config.json=config.json `
+            --output-filename=BudsFix.exe `
+            app.py
+
+      - name: Show artifact info
+        working-directory: tray
+        shell: pwsh
+        run: |
+          Get-ChildItem BudsFix.exe | Format-List Name,Length,LastWriteTime
+          certutil -hashfile BudsFix.exe SHA256
+
+      - name: Attach onefile exe to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tray/BudsFix.exe
+          fail_on_unmatched_files: true
+
+      - name: Upload artifact (manual dispatch) — onefile
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BudsFix-onefile
+          path: tray/BudsFix.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -103,9 +103,21 @@ def _task_xml() -> str:
 # Task Scheduler
 # ---------------------------------------------------------------------------
 
+def _hidden_kwargs() -> dict:
+    if sys.platform == "win32":
+        try:
+            si = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+            si.wShowWindow = 0  # SW_HIDE — required with STARTF_USESHOWWINDOW
+            return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    return {}
+
+
 def _run(cmd: list[str], timeout: float = 15) -> tuple[int, str, str]:
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **_hidden_kwargs())
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as exc:
         return 1, "", str(exc)
