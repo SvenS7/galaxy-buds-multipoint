@@ -35,13 +35,16 @@ On macOS you don't have to remember any of that: `macos/install-agent.sh` sets u
 a small background agent that writes the byte for you every time the buds connect.
 See [Keeping it applied](macos/README.md#keeping-it-applied).
 
+On Windows you now also don't have to remember it: `tray/` runs in the system tray and reapplies the fix on every connect, boot and case power-cycle. See [tray/README.md](tray/README.md) and [What's new in this fork](#whats-new-in-this-fork-windows-tray-app-by-svens7) below.
+
 ## Where things stand
 
 | platform | state | how |
 |---|---|---|
 | macOS 11+ | working, verified on hardware | Swift + IOBluetooth, in [macos/](macos/) |
 | Linux | written, not yet run against buds | Python + `AF_BLUETOOTH`, in [linux/](linux/) |
-| Windows 10+ | written, not yet run against buds | Python + `AF_BTH`, in [windows/](windows/) |
+| Windows 10+ | working, verified on hardware (Buds3 Pro, `tray/` app) | Python + `AF_BTH`, in [windows/](windows/) and [tray/](tray/) |
+| Windows Tray | working, verified on hardware (Buds3 Pro) | Python + `pystray` + `tkinter`, in [tray/](tray/) — `uv run app.py` |
 
 That middle column means exactly what it says. The Linux and Windows tools build
 byte-for-byte the same frames as the macOS one, checked against frames captured
@@ -151,6 +154,18 @@ budsmp apply
 Needs Python 3.9+ and nothing else — no administrator rights, no build step. Pair
 the buds in Settings first, then see [windows/README.md](windows/README.md).
 
+### Windows Tray App (added in this fork — SvenS7)
+
+No CLI needed — fully tray-driven. See [tray/README.md](tray/README.md).
+
+```powershell
+cd tray
+uv sync
+uv run app.py                 # blue B icon appears in the system tray
+```
+
+Right-click the tray: `Open` / `Check Buds status` / `Run fix now` / `Revert fix` / `Enable Autorun` / `Disable Autorun` / `Uninstall (full)` / `Close`. The app polls every 3s, reapplies on every `disconnected → connected` (20s debounce), does an immediate startup check at boot/login and a re-verify every 90s (auto re-apply after case/power-cycle when `asVer` falls back to `1`), and serializes RFCOMM access to avoid `10048` collisions. Autorun uses Task Scheduler with **both** `LogonTrigger` and `BootTrigger` (single XML task) with fallbacks to Startup `.bat` and `HKCU\...\Run`. See [What's new in this fork](#whats-new-in-this-fork-windows-tray-app-by-svens7) for full details.
+
 ### Just the protocol tools
 
 The frame builder and decoder run anywhere Python 3 does, with no dependencies:
@@ -203,12 +218,27 @@ undoes.
   multipoint arbitration rather than a defect.
 - A buds factory reset clears it.
 
+## What's new in this fork (Windows Tray App by SvenS7)
+
+> **Original project:** <https://github.com/id6917824/galaxy-buds-multipoint> (MIT, © 2026 galaxy-buds-multipoint contributors) by **id6917824** — protocol, firmware gate, `asVer` lifetime, `python/budsmp/*` frame/transport/discovery (vendored unchanged in `tray/budsmp/`).
+
+This fork adds a **Windows-only tray extension** on top of that core:
+
+- **Tray-first UX** (`tray/app.py`, `tray/tray_app.py`) — `uv run app.py` straight to the system tray (`pystray` + `Pillow` + `tkinter`), no CLI needed. Menu: `Open` / `Check Buds status` / `Run fix now` (`asVer=2`) / `Revert fix` / `Enable Autorun` / `Disable Autorun` / `Uninstall (full)` / `Close`; single-instance lock, hidden console when `--minimized`, dynamic enable/disable.
+- **Robust monitor** (`tray/buds_fix.py` — `BudsMonitor`) — polls `Get-PnpDevice` every 3s with 20s debounce, immediate startup status-check + auto-`apply` if already paired/connected, extra RFCOMM reachability probe when PnP says disconnected, 2-poll hysteresis for PnP flapping, periodic re-verify every 90s (auto re-apply when `asVer` is back to `1` after case/power-cycle), global `_rfcomm_lock` to prevent `10048` collisions. Reuses `frame.version_only(2)` → `fc0b00014304030400000b021eafcc`.
+- **Reliable autorun** (`tray/startup.py`) — prefers Task Scheduler XML with **both** `LogonTrigger` **and** `BootTrigger` (`GalaxyBudsMultipointFix`) so the app runs at boot *and* login; fallbacks: separate `onlogon` + `onstart` (`GalaxyBudsMultipointFixBoot`) → Startup `.bat` → `HKCU\...\Run`. `Disable Autorun` / `Uninstall` removes all variants.
+- **Full uninstall** — removes all Scheduler tasks, Startup items, registry key, `%LOCALAPPDATA%\GalaxyBudsMultipoint\logs`, `tray/logs/*.log`, `%TEMP%\budsmp-wake-*.wav`, lock file and AppData config, with a dialog of what was removed.
+- **Tooling & i18n** — `tray/pyproject.toml` (`pystray`, `Pillow`, `requires-python >=3.9`, `uv` managed, `uv.lock`), `tray/config.json` (`poll_interval`, `debounce_seconds`, `verify_interval`, …), all UI/logs translated to English, quiet operation (15s light refresh, heavy RFCOMM only on explicit action, rotating logs).
+- **Verified** on Buds3 Pro (`2C:DA:46:9D:33:94`) — `uv run app.py --status` reports `asVer=2` / `multipoint allowed`; tray runs silently without the previous `10048` storm.
+
+See `tray/README.md` for full usage, autorun details, reconnect/case handling and safety notes. The original `python/budsmp/*`, `windows/`, `linux/`, `macos/` and `docs/` remain as in the upstream.
+
 ## Disclaimer
 
 This is reverse engineering of hardware the author owns, done for
 interoperability with it — documenting one protocol detail so that devices
 already sitting in someone's pocket work together properly. It ships no Samsung
-code.
+code. The tray extension by **SvenS7** is also MIT and reuses the original logic unchanged.
 
 Please use it on your own devices. It isn't affiliated with, endorsed by, or
 supported by Samsung, it may well void your warranty, and a firmware update could
