@@ -1,0 +1,13 @@
+{
+    "name_needle": "buds",
+    "address": null,
+    "channel": null,
+    "as_ver": 2,
+    "poll_interval": 3.0,
+    "debounce_seconds": 20.0,
+    "auto_apply": true,
+    "listen_seconds": 6.0,
+    "attempts": 8,
+    "retry_delay": 0.7,
+    "minimized": true
+}
