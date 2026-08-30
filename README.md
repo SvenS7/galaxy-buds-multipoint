@@ -2,6 +2,18 @@
 
 Galaxy Buds multipoint on your computer — no Samsung account needed.
 
+> [!CAUTION]
+> ## Legal Disclaimer — Use At Your Own Risk
+> **THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.** By downloading, installing, or using this software you agree that you do so **entirely at your own risk**.
+>
+> * **No liability for damage:** I (**SvenS7**, maintainer of this fork / Windows Tray extension) am **absolutely NOT responsible or liable** for any damage, loss, or consequences resulting from the use or misuse of this software. This includes but is not limited to: damage to your Galaxy Buds or other hardware, loss of data, loss of functionality, warranty voidance, or any direct, indirect, incidental, consequential, or special damages.
+> * **Experimental / reverse-engineered:** This project is an independent, clean-room reverse-engineering effort for interoperability with hardware the authors own. It contains **no Samsung code** and **no code from GalaxyBudsClient**. It sends a single documented Bluetooth RFCOMM frame (`MDE_VERSION` / `asVer=2`) that a Galaxy phone normally sends during pairing. While tested on real hardware (Buds3 Pro), behavior on other models/firmware versions is unverified.
+> * **May void warranty / break with updates:** Modifying device state may void your Samsung warranty and may stop working after a Samsung firmware update. You are solely responsible for deciding whether to use it.
+> * **No affiliation:** "Galaxy Buds" and "Samsung" are trademarks of Samsung Electronics. This project is **not affiliated with, endorsed by, or supported by Samsung**.
+> * **Your responsibility:** You are responsible for complying with applicable laws in your jurisdiction, for using this only on devices you own, and for making backups if needed. If you do not agree to these terms, **do not use this software**.
+>
+> See the [MIT License](LICENSE) — *no warranty, no liability* — and the [full disclaimer below](#disclaimer).
+
 > **Tested on Galaxy Buds3 Pro**
 
 > **This fork adds — Windows Tray App by SvenS7** on top of the original by **id6917824**: tray-first `tray/app.py` (`uv run app.py` → system tray, no CLI), robust auto-fix on every connect/boot/case power-cycle (polling + hysteresis + RFCOMM lock, `tray/buds_fix.py`), reliable autorun at **boot + login** (Task Scheduler XML `LogonTrigger+BootTrigger` + fallbacks, `tray/startup.py`), full uninstall, `uv` project and English UI. Original `python/budsmp/*` vendored unchanged. Based on <https://github.com/id6917824/galaxy-buds-multipoint> (MIT). See [What's new in this fork](#whats-new-in-this-fork-windows-tray-app-by-svens7) and [tray/README.md](tray/README.md).
