@@ -117,6 +117,21 @@ def revert_fix(address: str, channel: int | None = None,
                      retry_delay=retry_delay, listen_seconds=listen_seconds)
 
 
+def _is_open_failed_msg(msg: str | None) -> bool:
+    """True if RFCOMM could not be opened — buds in case/off, not a real error to spam."""
+    if not msg:
+        return False
+    m = msg.lower()
+    return (
+        "rfcomm open failed" in m
+        or "10060" in m  # WSAETIMEDOUT — case closed / out of range
+        or "10064" in m  # WSAEHOSTDOWN
+        or "10065" in m  # WSAEHOSTUNREACH
+        or "10051" in m  # WSAENETUNREACH
+        or "failed to respond" in m
+    )
+
+
 def check_status(name_needle: str = "buds", address: str | None = None,
                  channel: int | None = None,
                  as_ver_probe: int = 2,
@@ -143,7 +158,10 @@ def check_status(name_needle: str = "buds", address: str | None = None,
         return BudsStatus(True, dev.connected, dev.address, dev.name,
                           reported, frame.multipoint_allowed(reported), None)
     if not ok:
-        # propagate actual error (open failed, RFCOMM busy, open error, etc.)
+        if _is_open_failed_msg(msg):
+            # PnP may still say OK for 10-30s after case closed — treat as disconnected
+            return BudsStatus(True, False, dev.address, dev.name, None, None,
+                              "disconnected (RFCOMM not reachable — buds in case/off?)")
         return BudsStatus(True, dev.connected, dev.address, dev.name, None, None, msg)
     return BudsStatus(True, dev.connected, dev.address, dev.name, None, None,
                       "no state frame (buds sleeping? start playback)")
@@ -210,6 +228,7 @@ class BudsMonitor(threading.Thread):
         self._last_fix_ts: dict[str, float] = {}
         self._last_verify_ts: dict[str, float] = {}
         self._last_disconnected_probe: dict[str, float] = {}
+        self._last_connected_probe: dict[str, float] = {}
         self._last_status: BudsStatus | None = None
         self._startup_done = False
         self._pnp_stable: dict[str, tuple[bool, int]] = {}  # addr -> (last_raw, stable_count)
@@ -293,11 +312,14 @@ class BudsMonitor(threading.Thread):
                     if not reachable:
                         reachable = _can_open_rfcomm(dev.address, channel, attempts=2, retry_delay=0.3, timeout=2.5)
                     if reachable:
-                        _, _, reported = _do_rfcomm_write(
+                        ok0, msg0, reported = _do_rfcomm_write(
                             dev.address, resolve_channel(dev.address, channel),
                             as_ver, attempts=max(attempts, 6),
                             retry_delay=retry_delay, listen_seconds=listen_seconds)
-                        if reported is not None and reported != as_ver:
+                        if _is_open_failed_msg(msg0) and reported is None and not ok0:
+                            log.info("startup-check %s \"%s\" RFCOMM not reachable — skip (case/off)", dev.address, dev.name)
+                            self._last_verify_ts[dev.address] = 0
+                        elif reported is not None and reported != as_ver:
                             log.info("startup-check %s \"%s\" asVer=%s -> fix", dev.address, dev.name, reported)
                             self._maybe_fix(dev.address, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason="startup")
                         elif reported is not None:
@@ -350,6 +372,25 @@ class BudsMonitor(threading.Thread):
                                 probed = True
                                 if self.on_event:
                                     self.on_event(f"Buds {dev.name}: PnP mismatch — still connected, checking fix…")
+                    # Symmetric check: PnP says connected but buds in case/off → RFCOMM fails quickly
+                    # Probe every ~8s so case-closed is detected within seconds, not 90s verify_interval
+                    if pnp_connected and auto_apply:
+                        last_probe = self._last_connected_probe.get(addr, 0)
+                        if now - last_probe >= 8.0:
+                            self._last_connected_probe[addr] = now
+                            if not _can_open_rfcomm(addr, channel, attempts=2, retry_delay=0.3, timeout=2.0):
+                                # Only treat as mismatch if we were previously thought connected
+                                # (was True) or we have never verified — avoids flap on cold start
+                                if was is True or was is None:
+                                    # Double-check with one more quick try to avoid transient BT hiccup
+                                    time.sleep(0.5)
+                                    if not _can_open_rfcomm(addr, channel, attempts=1, retry_delay=0.3, timeout=2.0):
+                                        log.info("PnP says connected but RFCOMM not reachable %s \"%s\" — treat as disconnected (case/off)", addr, dev.name)
+                                        is_now = False
+                                        probed = True
+                                        self._last_verify_ts[addr] = 0
+                                        if self.on_event and was is True:
+                                            self.on_event(f"Buds {dev.name}: disconnected (case/off)")
 
                     if dev == candidates[0]:
                         st = BudsStatus(True, is_now, dev.address, dev.name, None, None, None)
@@ -385,6 +426,20 @@ class BudsMonitor(threading.Thread):
                                     log.warning("re-verify %s asVer=%s expected %s -> re-apply (case/power-cycle?)", addr, reported, as_ver)
                                     self._maybe_fix(addr, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason=f"asVer={reported}->re-apply")
                                 elif reported is None:
+                                    if _is_open_failed_msg(msg):
+                                        log.info("re-verify %s RFCOMM open failed (%s) -> mark disconnected (case/off)", addr, msg)
+                                        is_now = False
+                                        self._last_connected[addr] = False
+                                        self._last_verify_ts[addr] = 0
+                                        if dev == candidates[0]:
+                                            st = BudsStatus(True, False, dev.address, dev.name, None, None,
+                                                            "disconnected (RFCOMM not reachable)")
+                                            self._last_status = st
+                                            if self.on_status:
+                                                self.on_status(st)
+                                        if self.on_event:
+                                            self.on_event(f"Buds {dev.name}: disconnected (case/off)")
+                                        continue
                                     log.debug("re-verify %s no state frame: %s", addr, msg)
                                 else:
                                     log.debug("re-verify %s asVer=%s ok", addr, reported)
