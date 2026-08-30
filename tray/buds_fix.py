@@ -18,6 +18,10 @@ log = logging.getLogger("buds_fix")
 
 SPP4_FALLBACK_CHANNEL = 29
 
+# Globaal slot: de Buds hebben maar één RFCOMM SPP4 socket; gelijktijdige opens
+# vanuit monitor + UI (StatusWindow) geven WSAEADDRINUSE 10048. Dit lock serialiseert alle opens.
+_rfcomm_lock = threading.Lock()
+
 
 @dataclass
 class BudsStatus:
@@ -55,46 +59,48 @@ def resolve_channel(address: str, override: int | None) -> int:
 def _do_rfcomm_write(address: str, channel: int, as_ver: int,
                      attempts: int, retry_delay: float,
                      listen_seconds: float) -> tuple[bool, str, int | None]:
-    """Voer één RFCOMM write uit. Returns (ok, msg, reported_as_ver)."""
+    """Voer één RFCOMM write uit. Returns (ok, msg, reported_as_ver). Serialiseert via _rfcomm_lock."""
+    # Wacht hooguit kort op lock; als UI en monitor tegelijk willen, laat één wachten
+    acquired = _rfcomm_lock.acquire(timeout=30)
+    if not acquired:
+        return False, "RFCOMM busy (andere operatie actief)", None
     try:
-        transport.bluetooth_family()
-    except transport.Unsupported as exc:
-        return False, str(exc), None
+        try:
+            transport.bluetooth_family()
+        except transport.Unsupported as exc:
+            return False, str(exc), None
 
-    fr = frame.version_only(as_ver)
-    log.info("RFCOMM open %s ch%d asVer=%d", address, channel, as_ver)
-    sess = transport.Session(address, channel, _null_log,
-                             attempts=attempts, retry_delay=retry_delay)
-    try:
-        sess.open()
-    except transport.OpenFailed as exc:
-        return False, f"RFCOMM open failed: {exc}", None
-    except Exception as exc:
-        return False, f"open error: {exc}", None
+        fr = frame.version_only(as_ver)
+        log.info("RFCOMM open %s ch%d asVer=%d", address, channel, as_ver)
+        sess = transport.Session(address, channel, _null_log,
+                                 attempts=attempts, retry_delay=retry_delay)
+        try:
+            sess.open()
+        except transport.OpenFailed as exc:
+            return False, f"RFCOMM open failed: {exc}", None
+        except Exception as exc:
+            return False, f"open error: {exc}", None
 
-    try:
-        sess.send([fr])
-        rx = sess.listen(listen_seconds)
+        try:
+            sess.send([fr])
+            rx = sess.listen(listen_seconds)
+        finally:
+            sess.close()
+
+        states = frame.decode_state(rx)
+        if not states:
+            return True, "verzonden (geen state frame — start/stop playback en check opnieuw)", None
+
+        reported = states[-1].as_ver
+        allowed = frame.multipoint_allowed(reported)
+        if reported == as_ver or (as_ver == 0 and reported <= 1):
+            return True, f"asVer={reported} ({'multipoint toegestaan' if allowed else 'geblokkeerd'})", reported
+        if len({s.as_ver for s in states}) > 1:
+            first = states[0].as_ver
+            return False, f"wrote {as_ver} maar device reports {reported} (was {first})", reported
+        return False, f"wrote {as_ver} maar device reports {reported}", reported
     finally:
-        sess.close()
-
-    states = frame.decode_state(rx)
-    if not states:
-        # Write kan gelukt zijn maar zonder NOTIFY (buds re-evalueren alleen bij audio-change)
-        # Beschouw als half-ok: verzonden maar niet geverifieerd
-        return True, "verzonden (geen state frame — start/stop playback en check opnieuw)", None
-
-    # laatste frame is huidige state (cli.py:229)
-    reported = states[-1].as_ver
-    allowed = frame.multipoint_allowed(reported)
-    # firmware normaliseert 0 -> 1
-    if reported == as_ver or (as_ver == 0 and reported <= 1):
-        return True, f"asVer={reported} ({'multipoint toegestaan' if allowed else 'geblokkeerd'})", reported
-    # asVer mismatch maar write is wel verzonden
-    if len({s.as_ver for s in states}) > 1:
-        first = states[0].as_ver
-        return False, f"wrote {as_ver} maar device reports {reported} (was {first})", reported
-    return False, f"wrote {as_ver} maar device reports {reported}", reported
+        _rfcomm_lock.release()
 
 
 def apply_fix(address: str, channel: int | None = None,
@@ -153,28 +159,33 @@ def check_status(name_needle: str = "buds", address: str | None = None,
 # Helpers voor robuuste detectie
 # ---------------------------------------------------------------------------
 
-def _can_open_rfcomm(address: str, channel: int | None, attempts: int = 3,
-                     retry_delay: float = 0.5, timeout: float = 4.0) -> bool:
+def _can_open_rfcomm(address: str, channel: int | None, attempts: int = 2,
+                     retry_delay: float = 0.4, timeout: float = 3.0) -> bool:
     """Snelle probe: is RFCOMM SPP4 bereikbaar ook als PnP 'disconnected' zegt?
 
-    De PnP-status is slechts een proxy (OK/Unknown) en blijft soms 'Unknown'
-    terwijl de Buds al wakker zijn. Een korte open is de ground truth.
+    Serialiseert via hetzelfde lock om 10048 te voorkomen; korte timeout.
     """
-    ch = resolve_channel(address, channel)
-    try:
-        transport.bluetooth_family()
-    except transport.Unsupported:
+    acquired = _rfcomm_lock.acquire(timeout=8)
+    if not acquired:
         return False
-    sess = transport.Session(address, ch, _null_log,
-                             attempts=attempts, retry_delay=retry_delay,
-                             connect_timeout=timeout)
     try:
-        sess.open()
-        return True
-    except Exception:
-        return False
+        ch = resolve_channel(address, channel)
+        try:
+            transport.bluetooth_family()
+        except transport.Unsupported:
+            return False
+        sess = transport.Session(address, ch, _null_log,
+                                 attempts=attempts, retry_delay=retry_delay,
+                                 connect_timeout=timeout)
+        try:
+            sess.open()
+            return True
+        except Exception:
+            return False
+        finally:
+            sess.close()
     finally:
-        sess.close()
+        _rfcomm_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +213,28 @@ class BudsMonitor(threading.Thread):
         self._last_disconnected_probe: dict[str, float] = {}
         self._last_status: BudsStatus | None = None
         self._startup_done = False
+        self._pnp_stable: dict[str, tuple[bool, int]] = {}  # addr -> (last_raw, stable_count)
 
     def stop(self):
         self._stop.set()
+
+    def _stable_is_now(self, addr: str, raw_connected: bool) -> bool:
+        """PnP flapt soms per poll tussen OK/Unknown. Eis 2x zelfde waarde voor transitie."""
+        last_raw, cnt = self._pnp_stable.get(addr, (raw_connected, 0))
+        if raw_connected == last_raw:
+            cnt = min(cnt + 1, 10)
+        else:
+            cnt = 1
+            last_raw = raw_connected
+        self._pnp_stable[addr] = (last_raw, cnt)
+        # Bij eerste waarneming meteen stabiel, daarna pas na 2 hits
+        if cnt >= 2:
+            return raw_connected
+        # tijdens instabiele fase: behoud vorige stabiele is_now
+        prev = self._last_connected.get(addr)
+        if prev is None:
+            return raw_connected  # eerste keer geen historie
+        return prev
 
     def _maybe_fix(self, addr: str, name: str, channel: int | None,
                    as_ver: int, attempts: int, retry_delay: float,
@@ -253,6 +283,7 @@ class BudsMonitor(threading.Thread):
 
         # Direct bij opstart: status-check en indien gekoppeld meteen fix proberen
         # (dekt cold-boot, login terwijl Buds al verbonden zijn, en case-cycle tijdens uit).
+        # Alleen fixen bij harde mismatch; geen-state is geen bewijs dat fix nodig is.
         if auto_apply:
             try:
                 if address:
@@ -261,25 +292,31 @@ class BudsMonitor(threading.Thread):
                 else:
                     cands0 = paired_buds(name_needle)
                 for dev in cands0:
-                    # Probeer ook als PnP "disconnected" zegt — RFCOMM is leading
-                    reachable = dev.connected or _can_open_rfcomm(dev.address, channel)
+                    # Alleen als PnP zegt verbonden, of heel kort RFCOMM probe lukt
+                    reachable = dev.connected
+                    if not reachable:
+                        # korte check zonder te spammen — alleen bij startup
+                        reachable = _can_open_rfcomm(dev.address, channel, attempts=2, retry_delay=0.3, timeout=2.5)
                     if reachable:
-                        # Snelle asVer-check: schrijf probe en lees terug
                         _, _, reported = _do_rfcomm_write(
                             dev.address, resolve_channel(dev.address, channel),
                             as_ver, attempts=max(attempts, 6),
                             retry_delay=retry_delay, listen_seconds=listen_seconds)
-                        # Als geen state of asVer != gewenst, dan fix
-                        if reported is None or reported != as_ver:
+                        if reported is not None and reported != as_ver:
                             log.info("startup-check %s \"%s\" asVer=%s -> fix", dev.address, dev.name, reported)
                             self._maybe_fix(dev.address, dev.name, channel, as_ver, attempts, retry_delay, listen_seconds, reason="startup")
-                        else:
+                        elif reported is not None:
                             log.info("startup-check %s asVer=%s ok — geen fix nodig", dev.address, reported)
                             self._last_fix_ts = time.monotonic()
+                            self._last_verify_ts = time.monotonic()
+                        else:
+                            log.info("startup-check %s geen state frame — geen conclusie, geen auto-fix", dev.address)
+                            # geen timestamp update, zodat connect-event later alsnog kan fixen
                             self._last_verify_ts = time.monotonic()
                 self._startup_done = True
             except Exception as exc:
                 log.debug("startup check faalde (niet fataal): %s", exc)
+                self._startup_done = True
 
         while not self._stop.is_set():
             try:
@@ -304,15 +341,17 @@ class BudsMonitor(threading.Thread):
                 for dev in candidates:
                     addr = dev.address
                     was = self._last_connected.get(addr)
-                    pnp_connected = bool(dev.connected)
-                    # Ground truth: als PnP nee zegt maar RFCOMM wel open kan, toch connected
+                    pnp_raw = bool(dev.connected)
+                    # Stabiliseer PnP: eis 2 polls zelfde waarde voor transitie
+                    pnp_connected = self._stable_is_now(addr, pnp_raw)
+                    # Ground truth: als gestabiliseerd PnP nee zegt maar RFCOMM wel open kan, toch connected
                     is_now = pnp_connected
                     probed = False
                     if not pnp_connected and auto_apply:
                         last_probe = self._last_disconnected_probe.get(addr, 0)
                         if now - last_probe >= disconnected_retry:
                             self._last_disconnected_probe[addr] = now
-                            if _can_open_rfcomm(addr, channel, attempts=3, retry_delay=0.4, timeout=3.0):
+                            if _can_open_rfcomm(addr, channel, attempts=2, retry_delay=0.4, timeout=2.5):
                                 log.info("PnP zegt disconnected maar RFCOMM open lukt %s \"%s\" — behandel als connected", addr, dev.name)
                                 is_now = True
                                 probed = True

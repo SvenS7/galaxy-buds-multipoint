@@ -147,18 +147,29 @@ class StatusWindow:
     def _schedule_refresh(self):
         if self.win is None or not self.win.winfo_exists():
             return
-        self._after_id = self.win.after(3000, self._auto_refresh)
+        # Alleen als venster zichtbaar is, en met rustig interval (voorkomt RFCOMM storm met monitor)
+        self._after_id = self.win.after(15000, self._auto_refresh)
 
     def _auto_refresh(self):
-        self.refresh_now(silent=True)
+        # Silent auto-refresh alleen autorun/pairstatus, geen RFCOMM storm
+        if self.win is None or not self.win.winfo_exists():
+            return
+        # Alleen lichte refresh: autorun label updaten, geen zware RFCOMM probe
+        try:
+            autorun_on = startup.is_installed()
+            self.labels["autorun"].config(text=f"Autorun: {'aan' if autorun_on else 'uit'} (start bij login)")
+        except Exception:
+            pass
         self._schedule_refresh()
 
     def refresh_now(self, silent: bool = False):
-        # Poll status zonder RFCOMM write indien mogelijk? We doen wel probe write
-        # maar met korte timeout; in venster tonen we "checking..."
-        if not silent:
-            self.labels["fix"].config(text="Fix: controleren…")
-            self.win.update_idletasks()
+        # Alleen expliciete user-actie (knop of tray) doet zware RFCOMM check_status;
+        # silent auto-refresh doet dat niet meer om 10048 te voorkomen
+        if silent:
+            # lichte silent path reeds in _auto_refresh — hier niets doen
+            return
+        self.labels["fix"].config(text="Fix: controleren…")
+        self.win.update_idletasks()
 
         def worker():
             try:
