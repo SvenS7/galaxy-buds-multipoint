@@ -1,6 +1,6 @@
 [project]
 name = "galaxy-buds-multipoint-tray"
-version = "0.1.0"
+version = "0.1.1"
 description = "A compact Windows tray app that automatically applies the Galaxy Buds multipoint fix (asVer=2 via SPPSERVICE4) to every Bluetooth connection. Based on https://github.com/id6917824/galaxy-buds-multipoint."
 
 readme = "README.md"
